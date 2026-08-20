@@ -26,14 +26,40 @@ HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
 LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", FIELD_BAR_CODE, "CANCEL_NAME", "ITEM_PERMIT_DATE"]
 BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "성분명", "효능효과", "용법용량"]
-# 추가 조회 항목의 선언부입니다. 새 API 필드는 원본 JSON 검증 후 이 표에 추가합니다.
-# 현재 5개 항목은 기존 코드에서 사용하던 필드/섹션 매핑만 유지합니다.
+# 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
+# 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
 EXTRA_FIELD_SPECS = {
     "소아_고령자투여": {"label": "소아·고령자 투여", "source": "NB_DOC_DATA", "keywords": ["소아에 대한 투여", "소아투여", "고령자에 대한 투여", "고령자투여"], "transform": "section"},
     "적용상의주의사항": {"label": "적용상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["적용상의 주의", "적용상 주의"], "transform": "section"},
     "임부_수유부투여": {"label": "임부 및 수유부 투여", "source": "NB_DOC_DATA", "keywords": ["임부 및 수유부에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"], "transform": "section"},
     "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항"], "transform": "section"},
-    "저장방법": {"label": "저장방법", "source": "STORAGE_METHOD", "transform": "direct"},
+    "금기사항": {"label": "금기사항", "source": "NB_DOC_DATA", "keywords": ["다음 환자에게는 투여하지 말 것", "투여하지 말 것", "금기"], "transform": "section"},
+    "신중투여": {"label": "신중히 투여할 환자", "source": "NB_DOC_DATA", "keywords": ["다음 환자에는 신중히 투여할 것", "신중히 투여"], "transform": "section"},
+    "이상반응": {"label": "이상반응", "source": "NB_DOC_DATA", "keywords": ["이상반응", "이상 반응"], "transform": "section"},
+    "일반적주의": {"label": "일반적 주의", "source": "NB_DOC_DATA", "keywords": ["일반적 주의"], "transform": "section"},
+    "상호작용": {"label": "상호작용", "source": "NB_DOC_DATA", "keywords": ["상호작용"], "transform": "section"},
+    "과량투여처치": {"label": "과량투여시의 처치", "source": "NB_DOC_DATA", "keywords": ["과량투여시의 처치", "과량투여", "과량 투여"], "transform": "section"},
+    "기타주의사항": {"label": "기타 사용상 주의사항", "source": "NB_DOC_DATA", "keywords": ["기타"], "transform": "section"},
+    "위탁제조원": {"label": "위탁제조원", "source": "CNSGN_MANUF", "transform": "direct"},
+    "전문일반구분": {"label": "전문·일반의약품 구분", "source": "ETC_OTC_CODE", "transform": "direct"},
+    "성상": {"label": "성상", "source": "CHART", "transform": "direct"},
+    "원료약품및분량": {"label": "원료약품 및 분량", "source": "MATERIAL_NAME", "transform": "direct"},
+    "유효기간": {"label": "유효기간", "source": "VALID_TERM", "transform": "direct"},
+    "포장단위": {"label": "포장단위", "source": "PACK_UNIT", "transform": "direct"},
+    "품목허가종류": {"label": "품목허가 종류", "source": "PERMIT_KIND_NAME", "transform": "direct"},
+    "제조수입구분": {"label": "제조·수입 구분", "source": "MAKE_MATERIAL_FLAG", "transform": "direct"},
+    "업종": {"label": "업종", "source": "INDUTY_TYPE", "transform": "direct"},
+    "변경일자": {"label": "변경일자", "source": "CHANGE_DATE", "transform": "direct"},
+    "변경내용": {"label": "변경내용", "source": "GBN_NAME", "transform": "direct"},
+    "ATC코드": {"label": "ATC 코드", "source": "ATC_CODE", "transform": "direct"},
+    "영문제품명": {"label": "영문 제품명", "source": "ITEM_ENG_NAME", "transform": "direct"},
+    "영문제조사명": {"label": "영문 제약사명", "source": "ENTP_ENG_NAME", "transform": "direct"},
+    "주성분영문명": {"label": "주성분 영문명", "source": "MAIN_INGR_ENG", "transform": "direct"},
+    "희귀의약품여부": {"label": "희귀의약품 여부", "source": "RARE_DRUG_YN", "transform": "direct"},
+    "재심사대상": {"label": "재심사 대상", "source": "REEXAM_TARGET", "transform": "direct"},
+    "재심사일자": {"label": "재심사 일자", "source": "REEXAM_DATE", "transform": "direct"},
+    "허가일자": {"label": "허가일자", "source": "ITEM_PERMIT_DATE", "transform": "direct"},
+    "허가취소일자": {"label": "허가취소일자", "source": "CANCEL_DATE", "transform": "direct"},
 }
 EXTRA_FIELD_ORDER = list(EXTRA_FIELD_SPECS)
 EXTRA_FIELD_LABELS = {key: spec["label"] for key, spec in EXTRA_FIELD_SPECS.items()}
@@ -137,12 +163,32 @@ def summarize_text(text, max_chars=420, max_sentences=3):
     return summary[:max_chars].rstrip() + ("…" if len(summary) > max_chars else "")
 
 
+def summarize_usage(text, max_chars=520):
+    """용법·용량에서 성인/소아/고령자 등 투여군별 문장을 우선 발췌합니다."""
+    text = clean_whitespace(text)
+    if not text:
+        return ""
+    headings = list(re.finditer(r"<[^>]{1,20}>", text))
+    if not headings:
+        return summarize_text(text, max_chars=max_chars, max_sentences=4)
+    parts = []
+    for index, match in enumerate(headings):
+        start = match.start()
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        section = text[start:end].strip()
+        if section:
+            parts.append(summarize_text(section, max_chars=180, max_sentences=2))
+    summary = " ".join(parts)
+    return summary[:max_chars].rstrip() + ("…" if len(summary) > max_chars else "")
+
+
 def make_summary_df(result_df):
     """용법·용량과 효능·효과를 짧게 표시하는 규칙 기반 요약본."""
     summary_df = result_df.copy()
-    for column in ["효능효과", "용법용량"]:
-        if column in summary_df.columns:
-            summary_df[column] = summary_df[column].map(lambda value: summarize_text(value))
+    if "효능효과" in summary_df.columns:
+        summary_df["효능효과"] = summary_df["효능효과"].map(lambda value: summarize_text(value))
+    if "용법용량" in summary_df.columns:
+        summary_df["용법용량"] = summary_df["용법용량"].map(lambda value: summarize_usage(value))
     for column in summary_df.columns:
         if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "제품코드", "약가"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
@@ -268,7 +314,11 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     missing_extras = [key for key in wanted_extras if key not in cached]
     if have_base and not missing_extras:
         return cached
-    if have_base and "_raw_nb_xml" in cached:
+    cached_direct_ready = all(
+        key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
+        for key in missing_extras
+    )
+    if have_base and "_raw_nb_xml" in cached and cached_direct_ready:
         for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
                 cached[key] = cached.get("_raw_" + key, "")

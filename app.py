@@ -26,21 +26,19 @@ HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
 LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", FIELD_BAR_CODE, "CANCEL_NAME", "ITEM_PERMIT_DATE"]
 BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "성분명", "효능효과", "용법용량"]
-EXTRA_FIELD_ORDER = ["소아_고령자투여", "적용상의주의사항", "임부_수유부투여", "보관_취급주의사항", "저장방법"]
-EXTRA_FIELD_LABELS = {
-    "소아_고령자투여": "소아·고령자 투여",
-    "적용상의주의사항": "적용상의 주의사항",
-    "임부_수유부투여": "임부 및 수유부 투여",
-    "보관_취급주의사항": "보관 및 취급상의 주의사항",
-    "저장방법": "저장방법",
+# 추가 조회 항목의 선언부입니다. 새 API 필드는 원본 JSON 검증 후 이 표에 추가합니다.
+# 현재 5개 항목은 기존 코드에서 사용하던 필드/섹션 매핑만 유지합니다.
+EXTRA_FIELD_SPECS = {
+    "소아_고령자투여": {"label": "소아·고령자 투여", "source": "NB_DOC_DATA", "keywords": ["소아에 대한 투여", "소아투여", "고령자에 대한 투여", "고령자투여"], "transform": "section"},
+    "적용상의주의사항": {"label": "적용상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["적용상의 주의", "적용상 주의"], "transform": "section"},
+    "임부_수유부투여": {"label": "임부 및 수유부 투여", "source": "NB_DOC_DATA", "keywords": ["임부 및 수유부에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"], "transform": "section"},
+    "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항"], "transform": "section"},
+    "저장방법": {"label": "저장방법", "source": "STORAGE_METHOD", "transform": "direct"},
 }
-EXTRA_FIELD_KEYWORDS = {
-    "소아_고령자투여": ["소아에 대한 투여", "소아투여", "고령자에 대한 투여", "고령자투여"],
-    "적용상의주의사항": ["적용상의 주의", "적용상 주의"],
-    "임부_수유부투여": ["임부 및 수유부에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"],
-    "보관_취급주의사항": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항"],
-}
-EXTRA_DIRECT_FIELDS = {"저장방법": "STORAGE_METHOD"}
+EXTRA_FIELD_ORDER = list(EXTRA_FIELD_SPECS)
+EXTRA_FIELD_LABELS = {key: spec["label"] for key, spec in EXTRA_FIELD_SPECS.items()}
+EXTRA_FIELD_KEYWORDS = {key: spec["keywords"] for key, spec in EXTRA_FIELD_SPECS.items() if "keywords" in spec}
+EXTRA_DIRECT_FIELDS = {key: spec["source"] for key, spec in EXTRA_FIELD_SPECS.items() if spec["transform"] == "direct"}
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 
@@ -117,6 +115,38 @@ def parse_doc_sections(xml_str, keywords):
     else:
         picked.extend(text for _, text in chunks if any(keyword in text for keyword in keywords))
     return clean_markup(" ".join(picked))
+
+
+def summarize_text(text, max_chars=420, max_sentences=3):
+    """의학적 판단을 새로 생성하지 않고, 원문 앞부분과 핵심 문장만 발췌합니다."""
+    text = clean_whitespace(text)
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+|(?=\d+\.)", text) if part.strip()]
+    selected = []
+    for sentence in sentences:
+        if sentence not in selected:
+            selected.append(sentence)
+        if len(selected) >= max_sentences:
+            break
+    summary = " ".join(selected)
+    if len(summary) < 80:
+        summary = text[:max_chars]
+    return summary[:max_chars].rstrip() + ("…" if len(summary) > max_chars else "")
+
+
+def make_summary_df(result_df):
+    """용법·용량과 효능·효과를 짧게 표시하는 규칙 기반 요약본."""
+    summary_df = result_df.copy()
+    for column in ["효능효과", "용법용량"]:
+        if column in summary_df.columns:
+            summary_df[column] = summary_df[column].map(lambda value: summarize_text(value))
+    for column in summary_df.columns:
+        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "제품코드", "약가"}:
+            summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
+    return summary_df
 
 
 def load_json_cache(path):
@@ -347,7 +377,8 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         # 표시용 제품코드는 바코드 숫자에서 [3:11] 위치의 8자리로 생성합니다.
         # 바코드가 없거나 11자리보다 짧으면 원본 바코드(또는 빈 문자열)를 표시합니다.
         raw_barcode = clean_whitespace(row.get(FIELD_BAR_CODE, ""))
-        display_product_code = barcode_key8(raw_barcode) or raw_barcode
+        # 바코드 매칭이 불가능하면 원래 품목코드로 되돌립니다.
+        display_product_code = barcode_key8(raw_barcode) or clean_whitespace(row.get("ITEM_SEQ", ""))
         out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": display_product_code, "약가": price, "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
@@ -426,12 +457,21 @@ if matches:
         height=min(520, 36 + len(search_df) * 35),
         selection_mode="multi-row",
         on_select="rerun",
-        key="search_results_table",
+        # 검색어별로 위젯 상태를 분리해 첫 행이 자동 선택되지 않도록 합니다.
+        key=f"search_results_table_{query.strip().casefold()}",
     )
-    for index in search_event.selection.rows:
-        seq = str(search_df.iloc[index]["품목코드"])
-        if seq and seq not in st.session_state.selection:
-            st.session_state.selection.append(seq)
+    # selection.rows는 현재 검색표의 위치 인덱스이므로 반드시 iloc로 매핑합니다.
+    search_selected_seqs = [
+        str(search_df.iloc[index]["품목코드"])
+        for index in search_event.selection.rows
+        if 0 <= index < len(search_df)
+    ]
+    st.caption(f"검색 결과에서 선택한 품목: **{len(search_selected_seqs)}건**")
+    if st.button("선택한 검색 결과를 조회 목록에 추가", disabled=not search_selected_seqs, key="add_search_selection"):
+        for seq in search_selected_seqs:
+            if seq and seq not in st.session_state.selection:
+                st.session_state.selection.append(seq)
+        st.rerun()
 
 st.subheader("2. 조회할 품목")
 selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
@@ -464,6 +504,11 @@ for key in EXTRA_FIELD_ORDER:
     if st.checkbox(EXTRA_FIELD_LABELS[key], key=f"extra_{key}"):
         selected_extras.append(key)
 
+summary_view = st.checkbox(
+    "요약 버전으로 보기",
+    help="AI가 새로운 의학적 판단을 생성하지 않고, 원문에서 앞부분과 문장 단위 내용을 발췌해 짧게 표시합니다.",
+)
+
 if st.button("선택한 품목 조회", type="primary", disabled=not st.session_state.selection):
     selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
     with st.spinner("식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
@@ -475,8 +520,11 @@ if st.button("선택한 품목 조회", type="primary", disabled=not st.session_
 if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
-    st.dataframe(result_df, use_container_width=True, hide_index=True)
-    csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+    displayed_df = make_summary_df(result_df) if summary_view else result_df
+    if summary_view:
+        st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다. 임상적 판단을 대신하지 않습니다.")
+    st.dataframe(displayed_df, use_container_width=True, hide_index=True)
+    csv_bytes = displayed_df.to_csv(index=False).encode("utf-8-sig")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}.csv", mime="text/csv")
     if st.session_state.last_errors:

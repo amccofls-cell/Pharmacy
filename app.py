@@ -344,7 +344,11 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
         price, method = match_price(item_name, row.get(FIELD_BAR_CODE, ""), hira_key, call_counter, cache_code, cache_name, errors)
         detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, wanted_extras, errors)
-        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": item_seq, "약가": price, "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", ""), "약가조회방법": method}
+        # 표시용 제품코드는 바코드 숫자에서 [3:11] 위치의 8자리로 생성합니다.
+        # 바코드가 없거나 11자리보다 짧으면 원본 바코드(또는 빈 문자열)를 표시합니다.
+        raw_barcode = clean_whitespace(row.get(FIELD_BAR_CODE, ""))
+        display_product_code = barcode_key8(raw_barcode) or raw_barcode
+        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": display_product_code, "약가": price, "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         output.append(out_row)
@@ -409,22 +413,49 @@ if query.strip():
     matches = [row for row in normal_rows if q in row.get("ITEM_NAME", "").casefold() or q in row.get("ENTP_NAME", "").casefold()][:200]
     st.caption(f"검색결과 {len(matches)}건 표시 (최대 200건)")
 
-match_options = {f"{row.get('ITEM_NAME','')} | {row.get('ENTP_NAME','')} | {row.get('ITEM_SEQ','')}": row.get("ITEM_SEQ", "") for row in matches}
-selected_from_search = st.multiselect("검색 결과에서 품목 선택", list(match_options.keys()))
-if st.button("선택 목록에 추가", disabled=not selected_from_search):
-    for label in selected_from_search:
-        seq = match_options[label]
+# 검색 결과를 드롭다운이 아닌 전체 행이 보이는 선택 가능한 표로 표시합니다.
+if matches:
+    search_df = pd.DataFrame([
+        {"의약품명": row.get("ITEM_NAME", ""), "제약사": row.get("ENTP_NAME", ""), "품목코드": row.get("ITEM_SEQ", "")}
+        for row in matches
+    ])
+    search_event = st.dataframe(
+        search_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(520, 36 + len(search_df) * 35),
+        selection_mode="multi-row",
+        on_select="rerun",
+        key="search_results_table",
+    )
+    for index in search_event.selection.rows:
+        seq = str(search_df.iloc[index]["품목코드"])
         if seq and seq not in st.session_state.selection:
             st.session_state.selection.append(seq)
-    st.rerun()
 
 st.subheader("2. 조회할 품목")
-selected_labels = [f"{by_seq[seq].get('ITEM_NAME','')} | {by_seq[seq].get('ENTP_NAME','')} | {seq}" for seq in st.session_state.selection if seq in by_seq]
-removed_labels = st.multiselect("선택 목록에서 제거할 품목", selected_labels)
-if st.button("선택 목록에서 제거", disabled=not removed_labels):
-    removed_seq = {label.rsplit(" | ", 1)[-1] for label in removed_labels}
-    st.session_state.selection = [seq for seq in st.session_state.selection if seq not in removed_seq]
-    st.rerun()
+selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
+if selected_rows:
+    selected_df = pd.DataFrame([
+        {"의약품명": row.get("ITEM_NAME", ""), "제약사": row.get("ENTP_NAME", ""), "품목코드": row.get("ITEM_SEQ", "")}
+        for row in selected_rows
+    ])
+    st.caption("아래 표에서 제거할 행을 선택한 뒤 버튼을 누르세요.")
+    selected_event = st.dataframe(
+        selected_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(360, 36 + len(selected_df) * 35),
+        selection_mode="multi-row",
+        on_select="rerun",
+        key="selected_items_table",
+    )
+    if st.button("선택한 품목 제거", disabled=not selected_event.selection.rows):
+        remove_seq = {str(selected_df.iloc[index]["품목코드"]) for index in selected_event.selection.rows}
+        st.session_state.selection = [seq for seq in st.session_state.selection if seq not in remove_seq]
+        st.rerun()
+else:
+    st.info("1번 검색 결과 표에서 조회할 행을 클릭하세요.")
 st.write(f"현재 선택된 품목: **{len(st.session_state.selection)}건**")
 
 st.subheader("3. 추가 조회 항목")

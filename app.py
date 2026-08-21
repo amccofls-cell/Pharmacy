@@ -464,19 +464,19 @@ def make_display_df(result_df, summary_view=False, transpose_view=False):
 
 def render_result_table(display_df):
     """긴 의학 텍스트가 셀 안에서 줄바꿈되도록 HTML 표로 렌더링합니다."""
-    table_html = display_df.to_html(index=True, escape=True, classes="drug-result-table", border=0)
-    st.markdown(
-        """
-        <style>
-        .drug-result-wrap { overflow-x: auto; width: 100%; }
-        .drug-result-table { border-collapse: collapse; width: max-content; min-width: 100%; table-layout: auto; font-size: 0.88rem; }
-        .drug-result-table th, .drug-result-table td { border: 1px solid #d9dee7; padding: 0.55rem; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.45; max-width: 520px; }
-        .drug-result-table th { background: #f3f6fa; font-weight: 700; position: sticky; top: 0; z-index: 1; }
-        .drug-result-table td:first-child, .drug-result-table th:first-child { min-width: 150px; max-width: 260px; }
-        </style>
-        <div class="drug-result-wrap">""" + table_html + "</div>",
-        unsafe_allow_html=True,
+    # 선행 공백/개행이 Markdown 코드블록으로 해석되지 않도록 한 줄 HTML로 구성합니다.
+    css = (
+        "<style>"
+        ".drug-result-wrap{overflow-x:auto;width:100%;}"
+        ".drug-result-table{border-collapse:collapse;width:max-content;min-width:100%;table-layout:auto;font-size:.88rem;}"
+        ".drug-result-table th,.drug-result-table td{border:1px solid #d9dee7;padding:.55rem;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;line-height:1.45;max-width:520px;}"
+        ".drug-result-table th{background:#f3f6fa;font-weight:700;position:sticky;top:0;z-index:1;}"
+        ".drug-result-table td:first-child,.drug-result-table th:first-child{min-width:150px;max-width:260px;}"
+        "</style>"
     )
+    table_html = display_df.to_html(index=True, escape=True, classes="drug-result-table", border=0)
+    html = css + '<div class="drug-result-wrap">' + table_html + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def lookup_selected(rows, mfds_key, hira_key, wanted_extras):

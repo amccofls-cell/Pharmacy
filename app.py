@@ -6,7 +6,7 @@ import re
 import time
 import html as html_lib
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -25,7 +25,8 @@ LIST_NUM_OF_ROWS = 500
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
 LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", FIELD_BAR_CODE, "CANCEL_NAME", "ITEM_PERMIT_DATE"]
-BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "성분명", "효능효과", "용법용량"]
+BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "성분명", "효능효과", "용법용량"]
+HIRA_MEFT_FIELD = "meftDivNo"
 # 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
 # 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
 EXTRA_FIELD_SPECS = {
@@ -40,15 +41,11 @@ EXTRA_FIELD_SPECS = {
     "상호작용": {"label": "상호작용", "source": "NB_DOC_DATA", "keywords": ["상호작용"], "transform": "section"},
     "과량투여처치": {"label": "과량투여시의 처치", "source": "NB_DOC_DATA", "keywords": ["과량투여시의 처치", "과량투여", "과량 투여"], "transform": "section"},
     "기타주의사항": {"label": "기타 사용상 주의사항", "source": "NB_DOC_DATA", "keywords": ["기타"], "transform": "section"},
-    "위탁제조원": {"label": "위탁제조원", "source": "CNSGN_MANUF", "transform": "direct"},
     "전문일반구분": {"label": "전문·일반의약품 구분", "source": "ETC_OTC_CODE", "transform": "direct"},
     "성상": {"label": "성상", "source": "CHART", "transform": "direct"},
     "원료약품및분량": {"label": "원료약품 및 분량", "source": "MATERIAL_NAME", "transform": "direct"},
     "유효기간": {"label": "유효기간", "source": "VALID_TERM", "transform": "direct"},
     "포장단위": {"label": "포장단위", "source": "PACK_UNIT", "transform": "direct"},
-    "품목허가종류": {"label": "품목허가 종류", "source": "PERMIT_KIND_NAME", "transform": "direct"},
-    "제조수입구분": {"label": "제조·수입 구분", "source": "MAKE_MATERIAL_FLAG", "transform": "direct"},
-    "업종": {"label": "업종", "source": "INDUTY_TYPE", "transform": "direct"},
     "변경일자": {"label": "변경일자", "source": "CHANGE_DATE", "transform": "direct"},
     "변경내용": {"label": "변경내용", "source": "GBN_NAME", "transform": "direct"},
     "ATC코드": {"label": "ATC 코드", "source": "ATC_CODE", "transform": "direct"},
@@ -56,10 +53,6 @@ EXTRA_FIELD_SPECS = {
     "영문제조사명": {"label": "영문 제약사명", "source": "ENTP_ENG_NAME", "transform": "direct"},
     "주성분영문명": {"label": "주성분 영문명", "source": "MAIN_INGR_ENG", "transform": "direct"},
     "희귀의약품여부": {"label": "희귀의약품 여부", "source": "RARE_DRUG_YN", "transform": "direct"},
-    "재심사대상": {"label": "재심사 대상", "source": "REEXAM_TARGET", "transform": "direct"},
-    "재심사일자": {"label": "재심사 일자", "source": "REEXAM_DATE", "transform": "direct"},
-    "허가일자": {"label": "허가일자", "source": "ITEM_PERMIT_DATE", "transform": "direct"},
-    "허가취소일자": {"label": "허가취소일자", "source": "CANCEL_DATE", "transform": "direct"},
 }
 EXTRA_FIELD_ORDER = list(EXTRA_FIELD_SPECS)
 EXTRA_FIELD_LABELS = {key: spec["label"] for key, spec in EXTRA_FIELD_SPECS.items()}
@@ -75,6 +68,9 @@ TEMP_FILE = DATA_DIR / "허가목록_임시.json"
 CACHE_CODE_FILE = DATA_DIR / "cache_약가_코드별.json"
 CACHE_NAME_FILE = DATA_DIR / "cache_약가_이름별.json"
 CACHE_DETAIL_FILE = DATA_DIR / "cache_상세정보.json"
+CACHE_MEFT_FILE = DATA_DIR / "cache_약효분류.json"
+LIST_META_FILE = DATA_DIR / "허가목록_메타.json"
+KST = timezone(timedelta(hours=9))
 
 
 def clean_whitespace(text):
@@ -308,6 +304,29 @@ def match_price(item_name, bar_code, service_key, call_counter, cache_code, cach
     return "", "매칭없음"
 
 
+def get_effect_classification(item_name, bar_code, service_key, call_counter, cache_meft, errors):
+    """심평원 응답의 meftDivNo를 항상 조회해 약효분류로 반환합니다."""
+    key8 = barcode_key8(bar_code)
+    cache_key = f"mdsCd:{key8}" if key8 else f"itmNm:{re.sub(r'_\(.*?\)\s*$', '', item_name or '').strip()}"
+    if cache_key in cache_meft:
+        return cache_meft[cache_key]
+    if call_counter["hira"] >= HIRA_CALL_LIMIT:
+        return ""
+    call_counter["hira"] += 1
+    try:
+        params = {"mdsCd": key8} if key8 else {"itmNm": re.sub(r"_\(.*?\)\s*$", "", item_name or "").strip()}
+        items = hira_get(service_key, params)
+    except (requests.RequestException, ValueError) as exc:
+        errors.append(f"HIRA 약효분류 {cache_key}: {exc}")
+        return ""
+    valid = [item for item in items if item.get("payTpNm") != "삭제"]
+    if key8:
+        valid = [item for item in valid if mdscd_key8(item.get("mdsCd")) == key8] or valid
+    value = clean_whitespace(valid[0].get(HIRA_MEFT_FIELD, "")) if valid else ""
+    cache_meft[cache_key] = value
+    return value
+
+
 def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors):
     cached = cache_detail.get(item_seq, {})
     have_base = "성분명" in cached
@@ -352,6 +371,21 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     return cached
 
 
+def current_kst_date():
+    return datetime.now(KST).date().isoformat()
+
+
+def list_cache_is_fresh():
+    if not LIST_FILE.exists() or not LIST_META_FILE.exists():
+        return False
+    try:
+        with LIST_META_FILE.open("r", encoding="utf-8") as file:
+            meta = json.load(file)
+        return meta.get("collected_date_kst") == current_kst_date()
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def fetch_list_page(page, mfds_key):
     params = {"serviceKey": mfds_key, "pageNo": page, "numOfRows": LIST_NUM_OF_ROWS, "type": "json"}
     last_err = None
@@ -369,13 +403,22 @@ def fetch_list_page(page, mfds_key):
 
 
 @st.cache_data(show_spinner=False)
-def load_permitted_drugs(mfds_key, data_dir_string):
+def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_token=0):
     list_file = Path(data_dir_string) / "허가목록_원본.csv"
     temp_file = Path(data_dir_string) / "허가목록_임시.json"
-    if list_file.exists():
+    meta_file = Path(data_dir_string) / "허가목록_메타.json"
+    cache_is_fresh = list_file.exists() and meta_file.exists()
+    if cache_is_fresh:
+        try:
+            with meta_file.open("r", encoding="utf-8") as file:
+                cache_is_fresh = json.load(file).get("collected_date_kst") == cache_day
+        except (OSError, json.JSONDecodeError):
+            cache_is_fresh = False
+    if cache_is_fresh:
         with list_file.open("r", encoding="utf-8-sig", newline="") as file:
-            rows = list(csv.DictReader(file))
-        return rows
+            return list(csv.DictReader(file))
+    if not mfds_key:
+        raise ValueError("오늘 날짜의 허가목록 캐시가 없습니다. 식약처 인증키를 입력해야 허가목록을 갱신할 수 있습니다.")
     if temp_file.exists():
         with temp_file.open("r", encoding="utf-8") as file:
             resume = json.load(file)
@@ -406,13 +449,41 @@ def load_permitted_drugs(mfds_key, data_dir_string):
         writer.writerows({key: row.get(key, "") for key in LIST_CSV_FIELDS} for row in all_rows)
     if temp_file.exists():
         temp_file.unlink()
+    with meta_file.open("w", encoding="utf-8") as file:
+        json.dump({"collected_date_kst": cache_day, "updated_at": datetime.now(KST).isoformat()}, file, ensure_ascii=False, indent=2)
     return all_rows
+
+
+def make_display_df(result_df, summary_view=False, transpose_view=False):
+    display_df = make_summary_df(result_df) if summary_view else result_df.copy()
+    if transpose_view:
+        display_df = display_df.T
+        display_df.index.name = "항목"
+    return display_df
+
+
+def render_result_table(display_df):
+    """긴 의학 텍스트가 셀 안에서 줄바꿈되도록 HTML 표로 렌더링합니다."""
+    table_html = display_df.to_html(index=True, escape=True, classes="drug-result-table", border=0)
+    st.markdown(
+        """
+        <style>
+        .drug-result-wrap { overflow-x: auto; width: 100%; }
+        .drug-result-table { border-collapse: collapse; width: max-content; min-width: 100%; table-layout: auto; font-size: 0.88rem; }
+        .drug-result-table th, .drug-result-table td { border: 1px solid #d9dee7; padding: 0.55rem; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.45; max-width: 520px; }
+        .drug-result-table th { background: #f3f6fa; font-weight: 700; position: sticky; top: 0; z-index: 1; }
+        .drug-result-table td:first-child, .drug-result-table th:first-child { min-width: 150px; max-width: 260px; }
+        </style>
+        <div class="drug-result-wrap">""" + table_html + "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     cache_code = load_json_cache(CACHE_CODE_FILE)
     cache_name = load_json_cache(CACHE_NAME_FILE)
     cache_detail = load_json_cache(CACHE_DETAIL_FILE)
+    cache_meft = load_json_cache(CACHE_MEFT_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors = []
     columns = BASE_COLUMNS + wanted_extras
@@ -422,14 +493,16 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         item_seq = row.get("ITEM_SEQ", "")
         item_name = clean_whitespace(row.get("ITEM_NAME", ""))
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
-        price, method = match_price(item_name, row.get(FIELD_BAR_CODE, ""), hira_key, call_counter, cache_code, cache_name, errors)
+        bar_code = row.get(FIELD_BAR_CODE, "")
+        price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
+        effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
         detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, wanted_extras, errors)
         # 표시용 제품코드는 바코드 숫자에서 [3:11] 위치의 8자리로 생성합니다.
         # 바코드가 없거나 11자리보다 짧으면 원본 바코드(또는 빈 문자열)를 표시합니다.
         raw_barcode = clean_whitespace(row.get(FIELD_BAR_CODE, ""))
         # 바코드 매칭이 불가능하면 원래 품목코드로 되돌립니다.
         display_product_code = barcode_key8(raw_barcode) or clean_whitespace(row.get("ITEM_SEQ", ""))
-        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": display_product_code, "약가": price, "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": display_product_code, "약가": price, "약효분류": effect_classification, "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         output.append(out_row)
@@ -438,6 +511,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     save_json_cache(CACHE_CODE_FILE, cache_code)
     save_json_cache(CACHE_NAME_FILE, cache_name)
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
+    save_json_cache(CACHE_MEFT_FILE, cache_meft)
     return pd.DataFrame(output), errors
 
 
@@ -457,19 +531,25 @@ with st.sidebar:
     hira_key = st.text_input("심평원 인증키 (디코딩된 키)", value=secret_hira, type="password")
     if st.button("허가목록 캐시 새로고침"):
         st.cache_data.clear()
-        if LIST_FILE.exists():
-            LIST_FILE.unlink()
+        for cache_path in (LIST_FILE, LIST_META_FILE, TEMP_FILE):
+            if cache_path.exists():
+                cache_path.unlink()
         st.rerun()
+    st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
 
-if not mfds_key or not hira_key:
-    st.info("사이드바에 식약처와 심평원 인증키를 입력하면 조회를 시작할 수 있습니다.")
+cache_day = current_kst_date()
+cache_fresh = list_cache_is_fresh()
+if not cache_fresh and not mfds_key:
+    st.warning("오늘 날짜의 허가목록 캐시가 없어 식약처 인증키가 필요합니다. 심평원 인증키는 실제 조회 시 필요합니다.")
     st.stop()
+if not hira_key:
+    st.info("검색목록은 열 수 있지만, 약가·상세정보 조회에는 심평원 인증키가 필요합니다.")
 
 try:
-    all_rows = load_permitted_drugs(mfds_key, str(DATA_DIR))
+    all_rows = load_permitted_drugs(mfds_key, str(DATA_DIR), cache_day)
 except Exception as exc:
     st.error(f"허가목록 수집에 실패했습니다: {exc}")
     st.exception(exc)
@@ -550,16 +630,18 @@ st.write(f"현재 선택된 품목: **{len(st.session_state.selection)}건**")
 
 st.subheader("3. 추가 조회 항목")
 selected_extras = []
-for key in EXTRA_FIELD_ORDER:
-    if st.checkbox(EXTRA_FIELD_LABELS[key], key=f"extra_{key}"):
-        selected_extras.append(key)
+extra_columns = st.columns(3)
+for index, key in enumerate(EXTRA_FIELD_ORDER):
+    with extra_columns[index % 3]:
+        if st.checkbox(EXTRA_FIELD_LABELS[key], key=f"extra_{key}"):
+            selected_extras.append(key)
 
 summary_view = st.checkbox(
     "요약 버전으로 보기",
     help="AI가 새로운 의학적 판단을 생성하지 않고, 원문에서 앞부분과 문장 단위 내용을 발췌해 짧게 표시합니다.",
 )
 
-if st.button("선택한 품목 조회", type="primary", disabled=not st.session_state.selection):
+if st.button("선택한 품목 조회", type="primary", disabled=not st.session_state.selection or not (mfds_key and hira_key)):
     selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
     with st.spinner("식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
         result_df, errors = lookup_selected(selected_rows, mfds_key, hira_key, selected_extras)
@@ -570,13 +652,16 @@ if st.button("선택한 품목 조회", type="primary", disabled=not st.session_
 if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
-    displayed_df = make_summary_df(result_df) if summary_view else result_df
+    transpose_view = st.checkbox("행/열 전환", key="result_transpose", help="표시와 CSV 다운로드 모두 행/열을 전환합니다.")
+    displayed_df = make_display_df(result_df, summary_view=summary_view, transpose_view=transpose_view)
     if summary_view:
         st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다. 임상적 판단을 대신하지 않습니다.")
-    st.dataframe(displayed_df, use_container_width=True, hide_index=True)
-    csv_bytes = displayed_df.to_csv(index=False).encode("utf-8-sig")
+    render_result_table(displayed_df)
+    # 화면에 표시한 동일한 DataFrame을 사용하므로 행/열 전환 상태가 CSV에도 반영됩니다.
+    csv_bytes = displayed_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}.csv", mime="text/csv")
+    csv_suffix = "_행열전환" if transpose_view else ""
+    st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}{csv_suffix}.csv", mime="text/csv")
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
             for error in st.session_state.last_errors:

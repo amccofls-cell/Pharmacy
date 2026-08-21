@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────────────────────
 # 의약품 허가정보·약가 통합 조회 — Streamlit version
@@ -510,15 +511,80 @@ def filter_result_dataframe(df, widget_prefix="result_filter"):
     return filtered
 
 
-def render_native_result_table(display_df, hide_index=True, height=620):
-    """Streamlit 네이티브 표: 컬럼 리사이즈·헤더 정렬·기본 상호작용을 유지합니다."""
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=hide_index,
-        height=height,
-        column_config=result_column_config(display_df),
-    )
+def render_resizable_wrapped_table(display_df, show_index=False, height=720, table_key="result"):
+    """외부 라이브러리 없이 컬럼 드래그 리사이즈와 셀 줄바꿈을 함께 제공합니다."""
+    table_df = display_df.reset_index() if show_index else display_df.reset_index(drop=True)
+    if show_index:
+        table_df = table_df.rename(columns={table_df.columns[0]: str(display_df.index.name or "항목")})
+    table_df = table_df.drop(columns=["제품코드"], errors="ignore")
+    headers = [str(column) for column in table_df.columns]
+    long_columns = {"효능효과", "용법용량", "성분명", "이상반응", "상호작용", "금기사항", "원료약품및분량"}
+    narrow_columns = {"약가", "제약사한글명", "약효분류"}
+
+    def cell(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
+            value = ""
+        return html_lib.escape(str(value)).replace("\\n", "<br>")
+
+    def width_for(header):
+        if header in narrow_columns:
+            return 200
+        if header == "허가제품명":
+            return 1000
+        if header in long_columns:
+            return 720
+        return 360
+
+    colgroup = "".join(f'<col data-column="{index}" style="width:{width_for(header)}px">' for index, header in enumerate(headers))
+    header_html = "".join(f'<th data-column="{index}">{cell(header)}<span class="resize-handle" data-column="{index}"></span></th>' for index, header in enumerate(headers))
+    body_html = []
+    for row in table_df.itertuples(index=False, name=None):
+        body_html.append("<tr>" + "".join(f"<td>{cell(value)}</td>" for value in row) + "</tr>")
+    markup = f"""
+    <style>
+      html, body {{ margin:0; padding:0; background:#fff; font-family:Arial, sans-serif; }}
+      .table-wrap {{ width:100%; height:calc(100vh - 24px); overflow:auto; border:1px solid #d9dee7; }}
+      table {{ border-collapse:collapse; table-layout:fixed; width:max-content; min-width:100%; font-size:13px; }}
+      col {{ width:360px; }}
+      th, td {{ border:1px solid #d9dee7; padding:8px; vertical-align:top; white-space:normal; overflow-wrap:anywhere; word-break:break-word; line-height:1.45; }}
+      th {{ position:sticky; top:0; z-index:2; background:#f3f6fa; font-weight:700; text-align:left; user-select:none; }}
+      .resize-handle {{ position:absolute; top:0; right:-4px; width:8px; height:100%; cursor:col-resize; z-index:3; }}
+      .resize-handle:hover, .resizing {{ background:#5b8def; opacity:.55; }}
+      body.resizing {{ cursor:col-resize; user-select:none; }}
+    </style>
+    <div class="table-wrap" id="wrap-{table_key}">
+      <table id="table-{table_key}"><colgroup>{colgroup}</colgroup><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>
+    </div>
+    <script>
+      (() => {{
+        const table = document.getElementById('table-{table_key}');
+        const cols = table.querySelectorAll('col');
+        table.querySelectorAll('.resize-handle').forEach(handle => {{
+          handle.addEventListener('mousedown', event => {{
+            event.preventDefault();
+            const index = Number(handle.dataset.column);
+            const startX = event.clientX;
+            const startWidth = cols[index].getBoundingClientRect().width;
+            document.body.classList.add('resizing');
+            handle.classList.add('resizing');
+            const move = moveEvent => {{
+              const nextWidth = Math.max(120, startWidth + moveEvent.clientX - startX);
+              cols[index].style.width = nextWidth + 'px';
+            }};
+            const stop = () => {{
+              document.body.classList.remove('resizing');
+              handle.classList.remove('resizing');
+              document.removeEventListener('mousemove', move);
+              document.removeEventListener('mouseup', stop);
+            }};
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', stop);
+          }});
+        }});
+      }})();
+    </script>
+    """
+    components.html(markup, height=height, scrolling=False)
 
 
 def make_comparison_df(result_df):
@@ -709,15 +775,14 @@ if st.button("선택한 품목 조회", type="primary", disabled=not st.session_
 if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
-    filtered_result_df = filter_result_dataframe(result_df)
-    st.caption(f"필터 결과: {len(filtered_result_df):,} / {len(result_df):,}건")
+    filtered_result_df = result_df
     result_tab, comparison_tab = st.tabs(["상세 결과", "여러 약품 비교표"])
     with result_tab:
         transpose_view = st.checkbox("행/열 전환", key="result_transpose", help="표시와 CSV 다운로드 모두 행/열을 전환합니다.")
         displayed_df = make_display_df(filtered_result_df, summary_view=summary_view, transpose_view=transpose_view)
         if summary_view:
             st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다. 임상적 판단을 대신하지 않습니다.")
-        render_native_result_table(displayed_df, hide_index=not transpose_view)
+        render_resizable_wrapped_table(displayed_df, show_index=transpose_view, height=720, table_key="detail")
         # 화면에 표시한 동일한 DataFrame을 사용하므로 행/열 전환 상태가 CSV에도 반영됩니다.
         csv_bytes = displayed_df.to_csv(index=transpose_view, encoding="utf-8-sig").encode("utf-8-sig")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -729,7 +794,7 @@ if st.session_state.last_result is not None:
         else:
             comparison_df = make_comparison_df(make_summary_df(filtered_result_df) if summary_view else filtered_result_df)
             st.caption("행은 조회 항목, 열은 의약품입니다. 헤더 경계를 드래그해 약품별 컬럼 너비를 조절할 수 있습니다.")
-            render_native_result_table(comparison_df, hide_index=False, height=700)
+            render_resizable_wrapped_table(comparison_df, show_index=True, height=760, table_key="comparison")
             comparison_csv = comparison_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button("비교표 CSV 다운로드", data=comparison_csv, file_name=f"의약품비교표_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
     if st.session_state.last_errors:

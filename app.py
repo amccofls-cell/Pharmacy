@@ -462,21 +462,78 @@ def make_display_df(result_df, summary_view=False, transpose_view=False):
     return display_df
 
 
-def render_result_table(display_df):
-    """긴 의학 텍스트가 셀 안에서 줄바꿈되도록 HTML 표로 렌더링합니다."""
-    # 선행 공백/개행이 Markdown 코드블록으로 해석되지 않도록 한 줄 HTML로 구성합니다.
-    css = (
-        "<style>"
-        ".drug-result-wrap{overflow-x:auto;width:100%;}"
-        ".drug-result-table{border-collapse:collapse;width:max-content;min-width:100%;table-layout:auto;font-size:.88rem;}"
-        ".drug-result-table th,.drug-result-table td{border:1px solid #d9dee7;padding:.55rem;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;line-height:1.45;max-width:520px;}"
-        ".drug-result-table th{background:#f3f6fa;font-weight:700;position:sticky;top:0;z-index:1;}"
-        ".drug-result-table td:first-child,.drug-result-table th:first-child{min-width:150px;max-width:260px;}"
-        "</style>"
+def result_column_config(df):
+    """긴 텍스트는 넓게 시작하고, Streamlit 표에서 드래그로 폭을 조절합니다."""
+    config = {}
+    long_columns = {"효능효과", "용법용량", "성분명", "이상반응", "상호작용", "금기사항", "원료약품및분량"}
+    for column in df.columns:
+        config[column] = st.column_config.TextColumn(
+            label=str(column),
+            width="large" if column in long_columns else "medium",
+            help="헤더 경계를 드래그해 컬럼 너비를 조절할 수 있습니다.",
+        )
+    return config
+
+
+def filter_result_dataframe(df, widget_prefix="result_filter"):
+    """컬럼별 필터를 적용해 결과 DataFrame을 반환합니다."""
+    filtered = df.copy()
+    with st.expander("컬럼별 필터", expanded=False):
+        st.caption("문자열은 포함 검색, 범주형은 여러 값 선택, 숫자형은 범위 필터를 사용합니다.")
+        filter_columns = st.columns(2)
+        for index, column in enumerate(df.columns):
+            series = df[column].fillna("")
+            numeric = pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce")
+            numeric_ratio = numeric.notna().mean() if len(series) else 0
+            with filter_columns[index % 2]:
+                if numeric_ratio >= 0.8 and numeric.notna().any():
+                    minimum, maximum = float(numeric.min()), float(numeric.max())
+                    if minimum < maximum:
+                        selected_range = st.slider(
+                            str(column), minimum, maximum, (minimum, maximum), key=f"{widget_prefix}_num_{index}"
+                        )
+                        filtered = filtered[numeric.loc[filtered.index].between(*selected_range)]
+                    else:
+                        st.caption(f"{column}: {minimum:g}")
+                else:
+                    values = sorted({str(value) for value in series if str(value).strip()})
+                    if 0 < len(values) <= 30:
+                        selected_values = st.multiselect(
+                            str(column), values, key=f"{widget_prefix}_cat_{index}"
+                        )
+                        if selected_values:
+                            filtered = filtered[filtered[column].astype(str).isin(selected_values)]
+                    else:
+                        text = st.text_input(f"{column} 포함 검색", key=f"{widget_prefix}_text_{index}")
+                        if text.strip():
+                            filtered = filtered[filtered[column].astype(str).str.contains(text.strip(), case=False, na=False)]
+    return filtered
+
+
+def render_native_result_table(display_df, hide_index=True, height=620):
+    """Streamlit 네이티브 표: 컬럼 리사이즈·헤더 정렬·기본 상호작용을 유지합니다."""
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=hide_index,
+        height=height,
+        column_config=result_column_config(display_df),
     )
-    table_html = display_df.to_html(index=True, escape=True, classes="drug-result-table", border=0)
-    html = css + '<div class="drug-result-wrap">' + table_html + "</div>"
-    st.markdown(html, unsafe_allow_html=True)
+
+
+def make_comparison_df(result_df):
+    """행에는 조회 항목, 열에는 의약품을 배치한 비교표를 생성합니다."""
+    comparison = result_df.copy()
+    comparison_names = []
+    seen = {}
+    for _, row in comparison.iterrows():
+        name = str(row.get("허가제품명", "품목"))
+        seen[name] = seen.get(name, 0) + 1
+        comparison_names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+    comparison["_비교용약품명"] = comparison_names
+    comparison = comparison.set_index("_비교용약품명").T
+    comparison.index.name = "조회 항목"
+    return comparison
 
 
 def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
@@ -652,16 +709,29 @@ if st.button("선택한 품목 조회", type="primary", disabled=not st.session_
 if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
-    transpose_view = st.checkbox("행/열 전환", key="result_transpose", help="표시와 CSV 다운로드 모두 행/열을 전환합니다.")
-    displayed_df = make_display_df(result_df, summary_view=summary_view, transpose_view=transpose_view)
-    if summary_view:
-        st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다. 임상적 판단을 대신하지 않습니다.")
-    render_result_table(displayed_df)
-    # 화면에 표시한 동일한 DataFrame을 사용하므로 행/열 전환 상태가 CSV에도 반영됩니다.
-    csv_bytes = displayed_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_suffix = "_행열전환" if transpose_view else ""
-    st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}{csv_suffix}.csv", mime="text/csv")
+    filtered_result_df = filter_result_dataframe(result_df)
+    st.caption(f"필터 결과: {len(filtered_result_df):,} / {len(result_df):,}건")
+    result_tab, comparison_tab = st.tabs(["상세 결과", "여러 약품 비교표"])
+    with result_tab:
+        transpose_view = st.checkbox("행/열 전환", key="result_transpose", help="표시와 CSV 다운로드 모두 행/열을 전환합니다.")
+        displayed_df = make_display_df(filtered_result_df, summary_view=summary_view, transpose_view=transpose_view)
+        if summary_view:
+            st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다. 임상적 판단을 대신하지 않습니다.")
+        render_native_result_table(displayed_df, hide_index=not transpose_view)
+        # 화면에 표시한 동일한 DataFrame을 사용하므로 행/열 전환 상태가 CSV에도 반영됩니다.
+        csv_bytes = displayed_df.to_csv(index=transpose_view, encoding="utf-8-sig").encode("utf-8-sig")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_suffix = "_행열전환" if transpose_view else ""
+        st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}{csv_suffix}.csv", mime="text/csv")
+    with comparison_tab:
+        if len(filtered_result_df) < 2:
+            st.info("두 품목 이상 조회하면 비교표가 표시됩니다.")
+        else:
+            comparison_df = make_comparison_df(make_summary_df(filtered_result_df) if summary_view else filtered_result_df)
+            st.caption("행은 조회 항목, 열은 의약품입니다. 헤더 경계를 드래그해 약품별 컬럼 너비를 조절할 수 있습니다.")
+            render_native_result_table(comparison_df, hide_index=False, height=700)
+            comparison_csv = comparison_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button("비교표 CSV 다운로드", data=comparison_csv, file_name=f"의약품비교표_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
             for error in st.session_state.last_errors:

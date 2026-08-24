@@ -3,7 +3,35 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="DUR 통합 정보 다중 조회", layout="wide")
+st.set_page_config(
+    page_title="DUR 통합 정보 다중 조회",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# 눈이 편안한 커스텀 스타일 (강렬한 빨간색 제거 및 소프트 톤 설정)
+st.markdown(
+    """
+    <style>
+    /* 눈에 부담 없는 은은한 배경 */
+    .stApp {
+        background-color: #f9fbfd;
+    }
+    /* 경고/알림 상자의 자극적인 빨간색 제거 */
+    .stAlert {
+        background-color: #f1f3f5 !important;
+        color: #212529 !important;
+        border: 1px solid #dee2e6 !important;
+    }
+    /* 메인 버튼 스타일 강조 완화 */
+    .stButton>button {
+        border-radius: 6px;
+    }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
+
 st.title("💊 DUR 통합 정보 다중 조회 서비스")
 
 # 사이드바 설정
@@ -29,9 +57,11 @@ API_ENDPOINTS = {
     "임부금기": "/getPwnmTabooInfoList03",
 }
 
-# 세션 상태 초기화 (선택된 의약품 바구니)
+# 세션 상태 초기화
 if "selected_basket" not in st.session_state:
     st.session_state["selected_basket"] = {}
+if "last_selected_row" not in st.session_state:
+    st.session_state["last_selected_row"] = None
 
 
 @st.cache_data(ttl=300)
@@ -49,10 +79,10 @@ def load_google_sheet_tab(doc_id, tab_name):
 
 
 def search_drug_candidates(keyword, service_key, sheet_id):
-    """키워드(부분 단어)로 품목코드와 품목명을 매칭하여 후보 목록 반환"""
-    candidates = {}
+    """키워드로 후보 목록 데이터프레임 생성"""
+    candidates = []
 
-    # 1. 심평원 DUR Master 품목 검색 API
+    # 1. 심평원 DUR Master API
     if service_key:
         try:
             url = f"{HIRA_DUR_BASE_URL}{MASTER_SEARCH_ENDPOINT}"
@@ -72,12 +102,11 @@ def search_drug_candidates(keyword, service_key, sheet_id):
                 code = str(item.get("ITEM_SEQ", "")).strip()
                 name = str(item.get("ITEM_NAME", "")).strip()
                 if code and name:
-                    label = f"[{code}] {name}"
-                    candidates[label] = {"code": code, "name": name}
+                    candidates.append({"품목코드": code, "품목명": name})
         except Exception:
             pass
 
-    # 2. 구글 시트에서 품목명 부분 일치 검색
+    # 2. 구글 시트
     if sheet_id:
         for _, tab_name in SHEET_TABS.items():
             sheet_df = load_google_sheet_tab(sheet_id, tab_name)
@@ -95,17 +124,17 @@ def search_drug_candidates(keyword, service_key, sheet_id):
                     code = str(row.get("품목코드", "")).strip()
                     name = str(row.get("품목명", "")).strip()
                     if code and name:
-                        label = f"[{code}] {name}"
-                        candidates[label] = {"code": code, "name": name}
+                        candidates.append({"품목코드": code, "품목명": name})
 
-    return candidates
+    if candidates:
+        return pd.DataFrame(candidates).drop_duplicates()
+    return pd.DataFrame()
 
 
 def fetch_dur_by_code(item_code, item_name, service_key, sheet_id):
-    """품목코드(itemSeq) 기준으로 API 및 구글시트 DUR 통합 조회"""
+    """품목코드 기준 DUR 통합 조회"""
     results = []
 
-    # 1. 심평원 API 조회
     if service_key:
         for category, endpoint in API_ENDPOINTS.items():
             try:
@@ -136,7 +165,6 @@ def fetch_dur_by_code(item_code, item_name, service_key, sheet_id):
             except Exception:
                 pass
 
-    # 2. 구글 시트 조회
     if sheet_id:
         for category, tab_name in SHEET_TABS.items():
             sheet_df = load_google_sheet_tab(sheet_id, tab_name)
@@ -160,76 +188,97 @@ def fetch_dur_by_code(item_code, item_name, service_key, sheet_id):
 # UI 구성
 # ------------------------------------------------------------------
 
-# 1단계: 검색 및 즉시 펼쳐지는 체크박스 목록
-st.subheader("1. 의약품 검색 및 목록 담기")
+# 1단계: 검색 및 클릭으로 즉시 담기
+st.subheader("1. 의약품 검색 및 선택")
 search_keyword = st.text_input(
     "의약품명의 일부를 입력하세요", placeholder="예: 타이레놀"
 )
 
 if search_keyword.strip():
     with st.spinner(f"'{search_keyword}' 검색 중..."):
-        candidates = search_drug_candidates(
+        cand_df = search_drug_candidates(
             search_keyword.strip(), hira_service_key, google_sheet_id
         )
 
-    if candidates:
-        st.write("📋 **검색 결과 (조회할 항목을 아래에서 바로 체크하세요):**")
+    if not cand_df.empty:
+        st.write("👉 **목록에서 원하는 의약품 행을 클릭하면 즉시 바구니에 담깁니다:**")
 
-        selected_labels = []
-        # 스크롤 가능한 고정 높이 상자 안에서 목록이 드롭다운 클릭 없이 바로 펼쳐집니다.
-        with st.container(height=250):
-            for label, info in candidates.items():
-                is_already_in = label in st.session_state["selected_basket"]
-                # 고유 Key 생성으로 충돌 방지
-                chk_key = f"chk_{info['code']}_{hash(label)}"
-                if st.checkbox(label, value=is_already_in, key=chk_key):
-                    selected_labels.append(label)
-
-        if st.button("선택한 의약품을 바구니에 담기"):
-            added_count = 0
-            for label in selected_labels:
-                if label not in st.session_state["selected_basket"]:
-                    st.session_state["selected_basket"][label] = candidates[
-                        label
-                    ]
-                    added_count += 1
-            st.success(f"{added_count}개 의약품이 바구니에 추가되었습니다.")
-    else:
-        st.warning(
-            "검색 결과가 없습니다. API 인증키, 구글 시트 ID, 키워드를 확인해 주세요."
+        # 클릭 이벤트 감지 지원 표
+        event = st.dataframe(
+            cand_df,
+            on_select="rerun",
+            selection_mode="single-row",
+            use_container_width=True,
+            hide_index=True,
+            height=200,
         )
+
+        selected_rows = event.selection.get("rows", [])
+        if selected_rows:
+            row_idx = selected_rows[0]
+            # 연속 동일 클릭 중복 방지
+            if st.session_state["last_selected_row"] != (
+                search_keyword,
+                row_idx,
+            ):
+                selected_item = cand_df.iloc[row_idx]
+                code = str(selected_item["품목코드"])
+                name = str(selected_item["품목명"])
+                key_name = f"[{code}] {name}"
+
+                st.session_state["selected_basket"][key_name] = {
+                    "code": code,
+                    "name": name,
+                }
+                st.session_state["last_selected_row"] = (
+                    search_keyword,
+                    row_idx,
+                )
+                st.success(f"'{name}' 의약품이 바구니에 담겼습니다.")
+                st.rerun()
+    else:
+        st.info("검색 결과가 없습니다.")
 
 st.divider()
 
-# 2단계: 담긴 의약품 바구니 확인 및 일괄 조회
-st.subheader("2. 선택된 의약품 바구니 (조회 대상)")
+# 2단계: 깔끔한 리스트 형태의 바구니
+st.subheader("2. 선택된 의약품 바구니 (리스트)")
 basket = st.session_state["selected_basket"]
 
 if basket:
-    current_labels = list(basket.keys())
-    selected_in_basket = st.multiselect(
-        "현재 담긴 의약품 목록 (제거하려면 X 버튼 클릭):",
-        options=current_labels,
-        default=current_labels,
-    )
+    st.caption("현재 담긴 의약품 목록입니다. (우측 ❌ 버튼을 눌러 삭제 가능)")
 
-    # 바구니 실시간 동기화
-    st.session_state["selected_basket"] = {
-        k: basket[k] for k in selected_in_basket if k in basket
-    }
+    keys_to_delete = []
+    # 세로 리스트 형태로 출력
+    for key, item_info in list(basket.items()):
+        col_text, col_btn = st.columns([6, 1])
+        with col_text:
+            st.markdown(
+                f"▪️ **[{item_info['code']}]** {item_info['name']}"
+            )
+        with col_btn:
+            if st.button("❌ 삭제", key=f"del_{item_info['code']}"):
+                keys_to_delete.append(key)
 
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        run_btn = st.button("DUR 통합 조회 실행", type="primary")
-    with col2:
-        if st.button("바구니 비우기"):
+    if keys_to_delete:
+        for k in keys_to_delete:
+            del st.session_state["selected_basket"][k]
+        st.rerun()
+
+    st.write("")
+    col_run, col_clear, _ = st.columns([2, 2, 6])
+    with col_run:
+        run_btn = st.button("⚡ DUR 통합 조회 실행", type="primary")
+    with col_clear:
+        if st.button("🗑️ 바구니 비우기"):
             st.session_state["selected_basket"] = {}
+            st.session_state["last_selected_row"] = None
             st.rerun()
 
-    # 3단계: 품목코드 기준 일괄 조회 수행
+    # 3단계: 통합 조회 실행
     if run_btn:
         all_results = []
-        with st.spinner("선택한 품목코드들의 DUR 정보를 가져오는 중..."):
+        with st.spinner("바구니의 의약품들에 대해 DUR 조회를 진행 중입니다..."):
             for label, info in st.session_state["selected_basket"].items():
                 res = fetch_dur_by_code(
                     info["code"],
@@ -242,10 +291,10 @@ if basket:
         if all_results:
             res_df = pd.DataFrame(all_results).drop_duplicates()
             st.success(
-                f"총 {len(st.session_state['selected_basket'])}개 품목에 대해 {len(res_df)}건의 DUR 정보 조회가 완료되었습니다."
+                f"총 {len(st.session_state['selected_basket'])}개 품목에 대해 {len(res_df)}건의 DUR 정보가 조회되었습니다."
             )
             st.dataframe(res_df, use_container_width=True)
         else:
-            st.info("선택한 품목코드들에 해당하는 DUR 금기/주의 정보가 없습니다.")
+            st.info("선택한 품목들에 대한 DUR 금기/주의 정보가 없습니다.")
 else:
-    st.info("상단에서 검색어 입력 후 의약품을 선택하여 바구니에 담아주세요.")
+    st.info("바구니가 비어있습니다. 상단에서 의약품을 검색한 뒤 목록의 행을 클릭해 주세요.")

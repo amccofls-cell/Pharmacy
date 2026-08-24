@@ -1,7 +1,0 @@
-__pycache__/
-*.pyc
-허가목록_원본.csv
-허가목록_임시.json
-허가목록_메타.json
-cache_*.json
-.streamlit/secrets.toml

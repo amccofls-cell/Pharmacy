@@ -25,7 +25,7 @@ FIELD_BAR_CODE = "BAR_CODE"
 LIST_NUM_OF_ROWS = 500
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
-LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", FIELD_BAR_CODE, "CANCEL_NAME", "ITEM_PERMIT_DATE"]
+LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE"]  # 바코드는 상세 API에서만 확인 가능
 BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "성분명", "효능효과", "용법용량"]
 HIRA_MEFT_FIELD = "meftDivNo"
 # 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
@@ -61,6 +61,17 @@ EXTRA_FIELD_KEYWORDS = {key: spec["keywords"] for key, spec in EXTRA_FIELD_SPECS
 EXTRA_DIRECT_FIELDS = {key: spec["source"] for key, spec in EXTRA_FIELD_SPECS.items() if spec["transform"] == "direct"}
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
+
+DUR_CATEGORIES = [
+    "병용금기(급여)", "병용금기(비급여)", "임부금기", "연령금기", "효능군중복",
+    "수유부주의", "비대면진료처방금지", "비용효과적인함량의약품",
+]
+DUR_EXTRA_COLUMNS = {
+    "임부금기": ["금기등급", "상세정보"],
+    "연령금기": ["특정연령", "특정연령단위코드", "연령처리조건", "상세정보"],
+    "효능군중복": ["효능군", "Group"],
+}
+DUR_CODE_COLUMN_PATTERN = re.compile(r"(제품코드|약품코드|품목코드)")
 
 DATA_DIR = Path(os.environ.get("DRUG_APP_DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -218,10 +229,65 @@ def barcode_key8(bar_code):
 
 
 def mdscd_key8(mds_cd):
-    if not mds_cd:
+    """엑셀에서 숫자로 저장된 코드는 645200020.0 처럼 float로 들어오는데, 그대로
+    문자열화하면 소수점의 '0'이 붙어 코드가 틀어지므로 정수로 먼저 변환합니다."""
+    if mds_cd is None:
+        return None
+    if isinstance(mds_cd, float):
+        if pd.isna(mds_cd):
+            return None
+        mds_cd = str(int(mds_cd))
+    elif not mds_cd:
         return None
     digits = re.sub(r"\D", "", str(mds_cd))
     return digits[:8] if len(digits) >= 8 else None
+
+
+def _excel_engine_for(filename):
+    return "pyxlsb" if filename.lower().endswith(".xlsb") else None
+
+
+def _find_dur_header_row(file_bytes, filename, max_scan=15):
+    """제목 행이 위에 몇 줄 더 있는 파일 대응: '코드'가 들어간 열이 나오는 행을 헤더로 판단합니다."""
+    engine = _excel_engine_for(filename)
+    raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine=engine, nrows=max_scan)
+    for i in range(len(raw)):
+        row_vals = [str(v) for v in raw.iloc[i].tolist()]
+        if any(DUR_CODE_COLUMN_PATTERN.search(v) for v in row_vals):
+            return i
+    return 0
+
+
+def read_dur_excel(file_bytes, filename):
+    engine = _excel_engine_for(filename)
+    header_row = _find_dur_header_row(file_bytes, filename)
+    df = pd.read_excel(io.BytesIO(file_bytes), header=header_row, engine=engine)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, header_row
+
+
+def build_dur_index(df):
+    """한 행에 코드 열이 2개(A/B)인 병용금기·비용효과적함량의약품 등도 전부 지원합니다."""
+    code_cols = [c for c in df.columns if DUR_CODE_COLUMN_PATTERN.search(str(c))]
+    if not code_cols:
+        return {}, code_cols
+    idx = {}
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        for col in code_cols:
+            key8 = mdscd_key8(row.get(col))
+            if key8:
+                idx.setdefault(key8, []).append(row_dict)
+    return idx, code_cols
+
+
+@st.cache_data(show_spinner="DUR 파일을 읽는 중입니다…")
+def parse_dur_excel_cached(file_bytes, filename):
+    """파일 내용(바이트)+이름이 그대로면 캐시된 결과를 재사용해, 다른 위젯을 조작할 때마다
+    무거운 엑셀을 다시 파싱하지 않도록 합니다."""
+    df, header_row = read_dur_excel(file_bytes, filename)
+    index, code_columns = build_dur_index(df)
+    return df, header_row, index, code_columns
 
 
 def _items_from_body(body):
@@ -363,6 +429,8 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["성분명"] = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
     cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
     cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
+    # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
+    cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
@@ -616,14 +684,14 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         item_seq = row.get("ITEM_SEQ", "")
         item_name = clean_whitespace(row.get("ITEM_NAME", ""))
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
-        bar_code = row.get(FIELD_BAR_CODE, "")
+        # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
+        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, wanted_extras, errors)
+        bar_code = detail.get("_bar_code", "")
         price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, wanted_extras, errors)
         # 표시용 제품코드는 바코드 숫자에서 [3:11] 위치의 8자리로 생성합니다.
-        # 바코드가 없거나 11자리보다 짧으면 원본 바코드(또는 빈 문자열)를 표시합니다.
-        raw_barcode = clean_whitespace(row.get(FIELD_BAR_CODE, ""))
-        # 바코드 매칭이 불가능하면 원래 품목코드로 되돌립니다.
+        # 바코드가 없거나 11자리보다 짧으면 원래 품목코드로 되돌립니다.
+        raw_barcode = clean_whitespace(bar_code)
         display_product_code = barcode_key8(raw_barcode) or clean_whitespace(row.get("ITEM_SEQ", ""))
         out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": display_product_code, "약가": price, "약효분류": effect_classification, "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
@@ -636,6 +704,34 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
     return pd.DataFrame(output), errors
+
+
+def check_dur(rows, mfds_key, dur_indices, cache_detail, call_counter, errors):
+    """선택한 품목들이 업로드된 DUR(병용금기 등) 리스트에 포함되는지 확인합니다."""
+    result_rows = []
+    seen_extra_cols = []
+    for row in rows:
+        item_seq = row.get("ITEM_SEQ", "")
+        item_name = clean_whitespace(row.get("ITEM_NAME", ""))
+        entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
+        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, [], errors)
+        key8 = barcode_key8(detail.get("_bar_code", ""))
+        if not key8:
+            continue
+        for category in DUR_CATEGORIES:
+            index = dur_indices.get(category, {})
+            if key8 not in index:
+                continue
+            for match in index[key8]:
+                result_row = {"허가제품명": item_name, "제약사한글명": entp_name, "DUR종류": category}
+                for column in DUR_EXTRA_COLUMNS.get(category, []):
+                    value = match.get(column, "")
+                    result_row[column] = "" if pd.isna(value) else str(value)
+                    if column not in seen_extra_cols:
+                        seen_extra_cols.append(column)
+                result_rows.append(result_row)
+    columns = ["허가제품명", "제약사한글명", "DUR종류"] + seen_extra_cols
+    return pd.DataFrame(result_rows, columns=columns)
 
 
 st.set_page_config(page_title="의약품 통합 조회", page_icon="💊", layout="wide")
@@ -662,6 +758,29 @@ with st.sidebar:
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
+    st.divider()
+    st.markdown("**DUR 품목리스트 업로드**")
+    st.caption("엑셀에 '제품코드'(또는 제품코드A/B, 약품코드) 열이 있어야 합니다. 매달 새 파일로 다시 올리면 그 종류만 갱신됩니다.")
+    if "dur_indices" not in st.session_state:
+        st.session_state.dur_indices = {}
+    for category in DUR_CATEGORIES:
+        uploaded = st.file_uploader(category, type=["xlsx", "xls", "xlsb"], key=f"dur_upload_{category}")
+        if uploaded is not None:
+            try:
+                # 파일 내용이 바뀌지 않았으면 다시 읽지 않습니다 (그래서 검색창 등 다른 위젯을
+                # 조작해도 매번 재파싱으로 느려지지 않습니다).
+                dur_df, header_row, dur_index, code_columns = parse_dur_excel_cached(uploaded.getvalue(), uploaded.name)
+            except Exception as exc:
+                st.error(f"[{category}] '{uploaded.name}' 읽기 실패: {exc}")
+            else:
+                if not code_columns:
+                    st.warning(
+                        f"[{category}] '{uploaded.name}'에서 제품코드/약품코드 열을 찾지 못했습니다. "
+                        f"(헤더로 인식한 행: {header_row}, 전체 열: {list(dur_df.columns)})"
+                    )
+                else:
+                    st.session_state.dur_indices[category] = dur_index
+                    st.success(f"[{category}] {len(dur_df):,}행, 코드열 {code_columns}, 매칭 제품코드 {len(dur_index):,}종 적용됨")
 
 cache_day = current_kst_date()
 cache_fresh = list_cache_is_fresh()
@@ -776,7 +895,7 @@ if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
     filtered_result_df = result_df
-    result_tab, comparison_tab = st.tabs(["상세 결과", "여러 약품 비교표"])
+    result_tab, comparison_tab, dur_tab = st.tabs(["상세 결과", "여러 약품 비교표", "DUR 확인"])
     with result_tab:
         transpose_view = st.checkbox("행/열 전환", key="result_transpose", help="표시와 CSV 다운로드 모두 행/열을 전환합니다.")
         displayed_df = make_display_df(filtered_result_df, summary_view=summary_view, transpose_view=transpose_view)
@@ -797,6 +916,38 @@ if st.session_state.last_result is not None:
             render_resizable_wrapped_table(comparison_df, show_index=True, height=760, table_key="comparison")
             comparison_csv = comparison_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button("비교표 CSV 다운로드", data=comparison_csv, file_name=f"의약품비교표_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+    with dur_tab:
+        if not st.session_state.dur_indices:
+            st.info("사이드바의 'DUR 품목리스트 업로드'에서 먼저 엑셀을 올려주세요.")
+        else:
+            if st.button("선택한 품목 DUR 확인", key="run_dur_check"):
+                dur_call_counter = {"hira": 0, "mfds": 0}
+                dur_errors = []
+                dur_cache_detail = load_json_cache(CACHE_DETAIL_FILE)
+                with st.spinner("DUR(병용금기 등) 확인 중입니다…"):
+                    dur_result_df = check_dur(
+                        selected_rows, mfds_key, st.session_state.dur_indices,
+                        dur_cache_detail, dur_call_counter, dur_errors,
+                    )
+                save_json_cache(CACHE_DETAIL_FILE, dur_cache_detail)
+                st.session_state.dur_result = dur_result_df
+                st.session_state.dur_errors = dur_errors
+            if "dur_result" in st.session_state:
+                dur_result_df = st.session_state.dur_result
+                if dur_result_df.empty:
+                    st.success("선택한 품목 중 업로드된 DUR 리스트에 해당하는 품목이 없습니다.")
+                else:
+                    st.dataframe(dur_result_df, use_container_width=True, hide_index=True)
+                    dur_csv = dur_result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    st.download_button(
+                        "DUR 확인 결과 CSV 다운로드", data=dur_csv,
+                        file_name=f"DUR확인결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv",
+                    )
+                if st.session_state.get("dur_errors"):
+                    with st.expander(f"DUR 확인 중 경고/오류 {len(st.session_state.dur_errors)}건"):
+                        for error in st.session_state.dur_errors:
+                            st.warning(error)
+
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
             for error in st.session_state.last_errors:

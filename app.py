@@ -12,7 +12,6 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────────────────────
 # 의약품 허가정보·약가 통합 조회 — Streamlit version
@@ -754,7 +753,7 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
       }})();
     </script>
     """
-    components.html(markup, height=height, scrolling=False)
+    st.iframe(markup, height=height, width="stretch")
 
 
 def make_comparison_df(result_df):
@@ -945,7 +944,7 @@ if matches:
     ])
     search_event = st.dataframe(
         search_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(520, 36 + len(search_df) * 35),
         selection_mode="multi-row",
@@ -976,7 +975,7 @@ if selected_rows:
     st.caption("아래 표에서 제거할 행을 선택한 뒤 버튼을 누르세요.")
     selected_event = st.dataframe(
         selected_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(360, 36 + len(selected_df) * 35),
         selection_mode="multi-row",
@@ -1061,7 +1060,7 @@ if st.session_state.last_result is not None:
                 if dur_result_df.empty:
                     st.success("선택한 품목 중 업로드된 DUR 리스트에 해당하는 품목이 없습니다.")
                 else:
-                    st.dataframe(dur_result_df, use_container_width=True, hide_index=True)
+                    st.dataframe(dur_result_df, width="stretch", hide_index=True)
                     dur_csv = dur_result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                     st.download_button(
                         "DUR 확인 결과 CSV 다운로드", data=dur_csv,

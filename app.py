@@ -874,6 +874,11 @@ with st.sidebar:
             if cache_path.exists():
                 cache_path.unlink()
         st.rerun()
+    if st.button("약가/상세정보 캐시 초기화", help="특정 약의 약가·상세정보가 실제와 다르게 안 뜰 때, 예전에 저장된(잘못됐을 수 있는) 캐시를 지우고 다시 조회합니다."):
+        for cache_path in (CACHE_CODE_FILE, CACHE_NAME_FILE, CACHE_DETAIL_FILE, CACHE_MEFT_FILE):
+            if cache_path.exists():
+                cache_path.unlink()
+        st.success("약가/상세정보 캐시를 지웠습니다. 다시 조회해주세요.")
     st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
     st.divider()
     st.markdown("**저장 위치**")

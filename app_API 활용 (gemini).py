@@ -4,7 +4,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="DUR 통합 정보 조회", layout="wide")
-st.title("💊 DUR 통합 정보 조회 서비스")
+st.title("💊 DUR 통합 정보 다중 조회 서비스")
 
 # 사이드바 설정
 st.sidebar.header("⚙️ 서비스 설정")
@@ -25,92 +25,195 @@ API_ENDPOINTS = {
     "임부금기": "/getPwnmTabooInfoList03",
 }
 
+# ------------------------------------------------------------------
+# 세션 상태(Session State) 초기화: 선택된 의약품 바구니
+# ------------------------------------------------------------------
+if "selected_drugs" not in st.session_state:
+    st.session_state["selected_drugs"] = []
+
 
 @st.cache_data(ttl=300)
 def load_google_sheet_tab(doc_id, tab_name):
-    """구글 시트 데이터를 로드합니다."""
+    """구글 시트 로드"""
     encoded_tab = quote(tab_name)
     url = f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet={encoded_tab}"
     try:
-        df = pd.read_csv(url)
-        return df
+        return pd.read_csv(url)
     except Exception:
         return pd.DataFrame()
 
 
-def fetch_hira_dur_by_name(endpoint, service_key, item_name):
-    """품목명(itemName) 기반 심평원 DUR API 호출"""
-    url = f"{HIRA_DUR_BASE_URL}{endpoint}"
-    # itemSeq 대신 itemName 사용
-    params = {"serviceKey": service_key, "type": "json", "itemName": item_name}
-    try:
-        res = requests.get(url, params=params, timeout=5).json()
-        body = res.get("body") or res.get("response", {}).get("body", {})
-        items = body.get("items", [])
-        return items if isinstance(items, list) else [items]
-    except Exception:
-        return []
+def search_drug_candidates(keyword, service_key, sheet_id):
+    """키워드가 포함된 의약품명 후보들을 API와 구글 시트에서 수집"""
+    candidates = set()
+
+    # 1. 심평원 API에서 검색 (병용금기 엔드포인트 등을 활용하여 품목명 검색)
+    if service_key:
+        try:
+            url = f"{HIRA_DUR_BASE_URL}{API_ENDPOINTS['병용금기']}"
+            params = {
+                "serviceKey": service_key,
+                "type": "json",
+                "itemName": keyword,
+            }
+            res = requests.get(url, params=params, timeout=5).json()
+            body = res.get("body") or res.get("response", {}).get("body", {})
+            items = body.get("items", [])
+            if not isinstance(items, list):
+                items = [items]
+            for item in items:
+                if item.get("ITEM_NAME"):
+                    candidates.add(item.get("ITEM_NAME"))
+        except Exception:
+            pass
+
+    # 2. 구글 시트에서 검색
+    if sheet_id:
+        for _, tab_name in SHEET_TABS.items():
+            sheet_df = load_google_sheet_tab(sheet_id, tab_name)
+            if not sheet_df.empty and "품목명" in sheet_df.columns:
+                matched = sheet_df[
+                    sheet_df["품목명"]
+                    .astype(str)
+                    .str.contains(keyword, case=False, na=False)
+                ]
+                for name in matched["품목명"].dropna().unique():
+                    candidates.add(str(name))
+
+    return sorted(list(candidates))
 
 
-# 사용자 입력 (의약품명)
-search_keyword = st.text_input(
-    "조회할 의약품명을 입력하세요 (부분 단어 검색 가능)",
-    placeholder="예: 타이레놀, 아스피린",
-)
+def fetch_dur_for_item(item_name, service_key, sheet_id):
+    """단일 의약품명에 대한 API + 구글시트 DUR 통합 조회"""
+    results = []
 
-if st.button("DUR 통합 정보 조회", type="primary"):
-    if not hira_service_key or not google_sheet_id:
-        st.error("좌측 사이드바에 심평원 API 인증키와 구글 시트 ID를 입력해 주세요.")
-    elif not search_keyword.strip():
-        st.warning("조회할 의약품명을 입력해 주세요.")
-    else:
-        keyword = search_keyword.strip()
-        results = []
+    # API 조회
+    for category, endpoint in API_ENDPOINTS.items():
+        if not service_key:
+            continue
+        try:
+            url = f"{HIRA_DUR_BASE_URL}{endpoint}"
+            params = {
+                "serviceKey": service_key,
+                "type": "json",
+                "itemName": item_name,
+            }
+            res = requests.get(url, params=params, timeout=5).json()
+            body = res.get("body") or res.get("response", {}).get("body", {})
+            items = body.get("items", [])
+            if not isinstance(items, list):
+                items = [items]
 
-        with st.spinner(f"'{keyword}' 검색 결과 통합 조회 중..."):
-            # 1. 심평원 API 조회 (품목명 기준)
-            for category, endpoint in API_ENDPOINTS.items():
-                api_data = fetch_hira_dur_by_name(endpoint, hira_service_key, keyword)
-                for item in api_data:
+            for item in items:
+                results.append(
+                    {
+                        "조회 의약품명": item_name,
+                        "DUR 구분": category,
+                        "금기/주의 내용": item.get("PROHBT_CONTENT")
+                        or item.get("REMARK")
+                        or item.get("TYPE_NAME", "내용 있음"),
+                        "데이터 출처": "심평원 API",
+                    }
+                )
+        except Exception:
+            pass
+
+    # 구글 시트 조회
+    if sheet_id:
+        for category, tab_name in SHEET_TABS.items():
+            sheet_df = load_google_sheet_tab(sheet_id, tab_name)
+            if not sheet_df.empty and "품목명" in sheet_df.columns:
+                matched = sheet_df[
+                    sheet_df["품목명"].astype(str).str.strip()
+                    == item_name.strip()
+                ]
+                for _, row in matched.iterrows():
                     results.append(
                         {
-                            "품목명": item.get("ITEM_NAME", keyword),
-                            "품목코드": item.get("ITEM_SEQ", "-"),
+                            "조회 의약품명": item_name,
                             "DUR 구분": category,
-                            "금기/주의 내용": item.get("PROHBT_CONTENT")
-                            or item.get("REMARK")
-                            or item.get("TYPE_NAME", "내용 있음"),
-                            "데이터 출처": "심평원 API",
+                            "금기/주의 내용": row.get("금기/주의내용", "-"),
+                            "데이터 출처": f"구글시트 ({tab_name})",
                         }
                     )
 
-            # 2. 구글 시트 조회 (품목명 부분 일치 검색)
-            for category, tab_name in SHEET_TABS.items():
-                sheet_df = load_google_sheet_tab(google_sheet_id, tab_name)
-                if not sheet_df.empty and "품목명" in sheet_df.columns:
-                    # 대소문자 구분 없이 입력한 키워드가 포함된 행 필터링
-                    matched = sheet_df[
-                        sheet_df["품목명"]
-                        .astype(str)
-                        .str.contains(keyword, case=False, na=False)
-                    ]
-                    for _, row in matched.iterrows():
-                        results.append(
-                            {
-                                "품목명": row.get("품목명", keyword),
-                                "품목코드": row.get("품목코드", "-"),
-                                "DUR 구분": category,
-                                "금기/주의 내용": row.get("금기/주의내용", "-"),
-                                "데이터 출처": f"구글시트 ({tab_name})",
-                            }
-                        )
+    return results
 
-        # 결과 출력
-        if results:
-            result_df = pd.DataFrame(results)
-            # 중복 결과 제거 (필요 시)
-            result_df = result_df.drop_duplicates()
-            st.success(f"총 {len(result_df)}건의 DUR 정보가 확인되었습니다.")
-            st.dataframe(result_df, use_container_width=True)
+
+# ------------------------------------------------------------------
+# UI 화면 구성
+# ------------------------------------------------------------------
+
+# 1단계: 키워드 검색 및 후보 드롭다운 선택
+st.subheader("1. 의약품 검색 및 후보 선택")
+search_keyword = st.text_input(
+    "검색할 의약품 키워드를 입력하세요", placeholder="예: 타이레놀"
+)
+
+if search_keyword.strip():
+    with st.spinner(f"'{search_keyword}' 관련 의약품 목록 찾는 중..."):
+        candidate_list = search_drug_candidates(
+            search_keyword.strip(), hira_service_key, google_sheet_id
+        )
+
+    if candidate_list:
+        selected_candidates = st.multiselect(
+            "검색된 의약품 목록 중 조회할 항목을 선택하세요:",
+            options=candidate_list,
+            help="여러 개를 동시에 선택할 수 있습니다.",
+        )
+
+        if st.button("선택한 의약품 목록에 추가"):
+            # 기존 목록에 중복 없이 추가
+            new_items = [
+                item
+                for item in selected_candidates
+                if item not in st.session_state["selected_drugs"]
+            ]
+            st.session_state["selected_drugs"].extend(new_items)
+            st.success(f"{len(new_items)}개 의약품이 조회 목록에 추가되었습니다.")
+    else:
+        st.info("검색 조건에 맞는 의약품 후보가 없습니다.")
+
+st.divider()
+
+# 2단계: 최종 선택된 의약품 목록 확인 및 DUR 실행
+st.subheader("2. 최종 조회 대상 목록")
+
+if st.session_state["selected_drugs"]:
+    # 드롭다운 형태로 목록 관리 (삭제 가능)
+    updated_basket = st.multiselect(
+        "현재 선택된 의약품 (X를 눌러 제거 가능):",
+        options=st.session_state["selected_drugs"],
+        default=st.session_state["selected_drugs"],
+    )
+    st.session_state["selected_drugs"] = updated_basket
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        run_search = st.button("DUR 통합 조회 실행", type="primary")
+    with col2:
+        if st.button("목록 전체 비우기"):
+            st.session_state["selected_drugs"] = []
+            st.rerun()
+
+    # 3단계: 조회 결과 출력
+    if run_search:
+        all_results = []
+        with st.spinner("선택된 의약품들의 DUR 정보를 가져오는 중..."):
+            for drug_name in st.session_state["selected_drugs"]:
+                res = fetch_dur_for_item(
+                    drug_name, hira_service_key, google_sheet_id
+                )
+                all_results.extend(res)
+
+        if all_results:
+            df_result = pd.DataFrame(all_results).drop_duplicates()
+            st.success(
+                f"총 {len(st.session_state['selected_drugs'])}개 의약품에 대해 {len(df_result)}건의 DUR 정보가 조회되었습니다."
+            )
+            st.dataframe(df_result, use_container_width=True)
         else:
-            st.info(f"'{keyword}'에 대한 DUR 금기/주의 정보가 없습니다.")
+            st.warning("선택한 의약품에 대한 DUR 주의/금기 사항이 없습니다.")
+else:
+    st.info("1단계에서 의약품을 검색하고 목록에 추가해 주세요.")

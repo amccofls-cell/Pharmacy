@@ -26,7 +26,7 @@ LIST_NUM_OF_ROWS = 500
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
 LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE"]  # 바코드는 상세 API에서만 확인 가능
-BASE_COLUMNS = ["허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
+BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량", "보관방법"]
 HIRA_MEFT_FIELD = "meftDivNo"
 # 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
 # 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
@@ -65,8 +65,8 @@ EXTRA_FIELD_ORDER = [
 EXTRA_FIELD_LABELS = {key: EXTRA_FIELD_SPECS[key]["label"] for key in EXTRA_FIELD_ORDER}
 EXTRA_FIELD_KEYWORDS = {key: EXTRA_FIELD_SPECS[key]["keywords"] for key in EXTRA_FIELD_ORDER if "keywords" in EXTRA_FIELD_SPECS[key]}
 EXTRA_DIRECT_FIELDS = {key: EXTRA_FIELD_SPECS[key]["source"] for key in EXTRA_FIELD_ORDER if EXTRA_FIELD_SPECS[key]["transform"] == "direct"}
-ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
-RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
+ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "보관방법"]
+RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량", "보관방법"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 
@@ -206,7 +206,7 @@ def make_summary_df(result_df):
     if "용법용량" in summary_df.columns:
         summary_df["용법용량"] = summary_df["용법용량"].map(lambda value: summarize_usage(value))
     for column in summary_df.columns:
-        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명"}:
+        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "주성분영문명", "보관방법"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
     return summary_df
 
@@ -510,6 +510,8 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
     # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
     cached["_bar_code"] = item.get("BAR_CODE", "")
+    cached["제품코드"] = barcode_key8(cached["_bar_code"]) or clean_whitespace(item_seq)
+    cached["보관방법"] = clean_whitespace(item.get("STORAGE_METHOD", ""))
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
     for key, field in EXTRA_DIRECT_FIELDS.items():
@@ -792,7 +794,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         bar_code = detail.get("_bar_code", "")
         price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "약가": price, "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "제품코드": detail.get("제품코드", barcode_key8(bar_code) or clean_whitespace(item_seq)), "약가": price, "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", ""), "보관방법": detail.get("보관방법", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         output.append(out_row)
@@ -879,29 +881,6 @@ with st.sidebar:
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
-    st.divider()
-    st.markdown("**DUR 품목리스트 업로드**")
-    st.caption("엑셀에 '제품코드'(또는 제품코드A/B, 약품코드) 열이 있어야 합니다. 매달 새 파일로 다시 올리면 그 종류만 갱신됩니다.")
-    if "dur_indices" not in st.session_state:
-        st.session_state.dur_indices = {}
-    for category in DUR_CATEGORIES:
-        uploaded = st.file_uploader(category, type=["xlsx", "xls", "xlsb"], key=f"dur_upload_{category}")
-        if uploaded is not None:
-            try:
-                # 파일 내용이 바뀌지 않았으면 다시 읽지 않습니다 (그래서 검색창 등 다른 위젯을
-                # 조작해도 매번 재파싱으로 느려지지 않습니다).
-                dur_df, header_row, dur_index, code_columns = parse_dur_excel_cached(uploaded.getvalue(), uploaded.name)
-            except Exception as exc:
-                st.error(f"[{category}] '{uploaded.name}' 읽기 실패: {exc}")
-            else:
-                if not code_columns:
-                    st.warning(
-                        f"[{category}] '{uploaded.name}'에서 제품코드/약품코드 열을 찾지 못했습니다. "
-                        f"(헤더로 인식한 행: {header_row}, 전체 열: {list(dur_df.columns)})"
-                    )
-                else:
-                    st.session_state.dur_indices[category] = dur_index
-                    st.success(f"[{category}] {len(dur_df):,}행, 코드열 {code_columns}, 매칭 제품코드 {len(dur_index):,}종 적용됨")
 
 cache_day = current_kst_date()
 cache_fresh = list_cache_is_fresh()
@@ -1016,7 +995,7 @@ if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
     filtered_result_df = result_df
-    result_tab, comparison_tab, dur_tab = st.tabs(["상세 결과", "여러 약품 비교표", "DUR 확인"])
+    result_tab, comparison_tab = st.tabs(["상세 결과", "여러 약품 비교표"])
     with result_tab:
         transpose_view = st.checkbox(
             "행/열 전환", key="result_transpose", value=True,
@@ -1040,37 +1019,6 @@ if st.session_state.last_result is not None:
             render_resizable_wrapped_table(comparison_df, show_index=True, height=760, table_key="comparison")
             comparison_csv = comparison_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button("비교표 CSV 다운로드", data=comparison_csv, file_name=f"의약품비교표_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
-    with dur_tab:
-        if not st.session_state.dur_indices:
-            st.info("사이드바의 'DUR 품목리스트 업로드'에서 먼저 엑셀을 올려주세요.")
-        else:
-            if st.button("선택한 품목 DUR 확인", key="run_dur_check"):
-                dur_call_counter = {"hira": 0, "mfds": 0}
-                dur_errors = []
-                dur_cache_detail = load_json_cache(CACHE_DETAIL_FILE)
-                with st.spinner("DUR(병용금기 등) 확인 중입니다…"):
-                    dur_result_df = check_dur(
-                        selected_rows, mfds_key, st.session_state.dur_indices,
-                        dur_cache_detail, dur_call_counter, dur_errors,
-                    )
-                save_json_cache(CACHE_DETAIL_FILE, dur_cache_detail)
-                st.session_state.dur_result = dur_result_df
-                st.session_state.dur_errors = dur_errors
-            if "dur_result" in st.session_state:
-                dur_result_df = st.session_state.dur_result
-                if dur_result_df.empty:
-                    st.success("선택한 품목 중 업로드된 DUR 리스트에 해당하는 품목이 없습니다.")
-                else:
-                    st.dataframe(dur_result_df, use_container_width=True, hide_index=True)
-                    dur_csv = dur_result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                    st.download_button(
-                        "DUR 확인 결과 CSV 다운로드", data=dur_csv,
-                        file_name=f"DUR확인결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv",
-                    )
-                if st.session_state.get("dur_errors"):
-                    with st.expander(f"DUR 확인 중 경고/오류 {len(st.session_state.dur_errors)}건"):
-                        for error in st.session_state.dur_errors:
-                            st.warning(error)
 
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):

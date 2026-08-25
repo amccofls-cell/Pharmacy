@@ -128,7 +128,7 @@ def parse_nested_doc_xml(xml_str):
 
 
 def parse_doc_sections(xml_str, keywords):
-    if not xml_str or not xml_str.strip():
+    if not xml_str or not xml_str.strip() or not keywords:
         return ""
     try:
         root = ET.fromstring(xml_str.strip())
@@ -305,7 +305,6 @@ def _excel_engine_for(filename):
 
 
 def read_dur_excel(file_bytes, filename):
-    """모든 시트(Sheet)를 순회해 파싱 후 하나의 DataFrame으로 병합합니다."""
     engine = _excel_engine_for(filename)
     all_sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None, engine=engine)
     
@@ -465,8 +464,10 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached = cache_detail.get(item_seq, {})
     have_base = "성분명" in cached
     missing_extras = [key for key in wanted_extras if key not in cached]
+    
     if have_base and not missing_extras:
         return cached
+        
     cached_direct_ready = all(
         key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
         for key in missing_extras
@@ -475,12 +476,16 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
                 cached[key] = cached.get("_raw_" + key, "")
-            else:
+            elif key in EXTRA_FIELD_KEYWORDS:
                 cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
+            else:
+                cached[key] = ""
         cache_detail[item_seq] = cached
         return cached
+
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
+
     call_counter["mfds"] += 1
     params = {"serviceKey": service_key, "item_seq": item_seq, "type": "json"}
     try:
@@ -492,7 +497,7 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     except (requests.RequestException, ValueError, ET.ParseError) as exc:
         errors.append(f"MFDS 상세 item_seq={item_seq}: {exc}")
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-    
+
     nb_xml = item.get("NB_DOC_DATA", "")
     cached["성분명"] = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
     cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
@@ -500,12 +505,13 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
-    
+
     cached["제품코드"] = barcode_key8(cached["_bar_code"]) or clean_whitespace(item_seq)
     cached["보관방법"] = clean_whitespace(item.get("STORAGE_METHOD", ""))
-    
+
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
+
     for key in wanted_extras:
         if key in EXTRA_DIRECT_FIELDS:
             cached[key] = cached.get("_raw_" + key, "")
@@ -513,6 +519,7 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
             cached[key] = parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
         else:
             cached[key] = ""
+
     cache_detail[item_seq] = cached
     return cached
 
@@ -730,7 +737,6 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     cache_meft = load_json_cache(CACHE_MEFT_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors = []
-    columns = BASE_COLUMNS + wanted_extras
     output = []
     progress = st.progress(0, text="조회 중입니다…")
     for index, row in enumerate(rows, start=1):

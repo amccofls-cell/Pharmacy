@@ -18,7 +18,7 @@ import streamlit.components.v1 as components
 # 의약품 허가정보·약가 통합 조회 — Streamlit version
 # 기존 Colab 노트북의 API 엔드포인트/필드명/매칭 규칙을 유지합니다.
 # ─────────────────────────────────────────────────────────────
-MFDS_LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
+MFDS_LIST_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 MFDS_DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
 HIRA_PRICE_URL = "https://apis.data.go.kr/B551182/dgamtCrtrInfoService1.2/getDgamtList"
 FIELD_BAR_CODE = "BAR_CODE"
@@ -542,7 +542,7 @@ def fetch_list_page(page, mfds_key):
     last_err = None
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            resp = requests.get(MFDS_LIST_URL, params=params, timeout=30)
+            resp = requests.get(MFDS_LIST_URL, params=params, timeout=60)
             resp.raise_for_status()
             data = resp.json()
             body = data.get("body", data.get("response", {}).get("body", {}))
@@ -577,22 +577,30 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
     else:
         all_rows, page, total_count = [], 1, None
     progress = st.progress(0, text="식약처 허가목록을 수집하는 중입니다…")
-    while True:
-        body, items = fetch_list_page(page, mfds_key)
-        if total_count is None:
-            total_count = int(body.get("totalCount", 0))
-        if not items:
-            break
-        all_rows.extend(items)
-        page += 1
-        if total_count:
-            progress.progress(min(len(all_rows) / total_count, 1.0), text=f"허가목록 수집 중: {len(all_rows):,}/{total_count:,}")
-        if page % 10 == 0 or (total_count and len(all_rows) >= total_count):
-            with temp_file.open("w", encoding="utf-8") as file:
-                json.dump({"rows": all_rows, "next_page": page, "total_count": total_count}, file, ensure_ascii=False)
-        if total_count and len(all_rows) >= total_count:
-            break
-        time.sleep(0.1)
+    try:
+        while True:
+            body, items = fetch_list_page(page, mfds_key)
+            if total_count is None:
+                total_count = int(body.get("totalCount", 0))
+            if not items:
+                break
+            all_rows.extend(items)
+            page += 1
+            if total_count:
+                progress.progress(min(len(all_rows) / total_count, 1.0), text=f"허가목록 수집 중: {len(all_rows):,}/{total_count:,}")
+            if page % 10 == 0 or (total_count and len(all_rows) >= total_count):
+                with temp_file.open("w", encoding="utf-8") as file:
+                    json.dump({"rows": all_rows, "next_page": page, "total_count": total_count}, file, ensure_ascii=False)
+            if total_count and len(all_rows) >= total_count:
+                break
+            time.sleep(0.1)
+    except Exception as exc:
+        progress.empty()
+        if list_file.exists():
+            st.warning(f"오늘 허가목록 갱신에 실패해 기존 캐시를 사용합니다: {exc}")
+            with list_file.open("r", encoding="utf-8-sig", newline="") as file:
+                return list(csv.DictReader(file))
+        raise
     progress.empty()
     with list_file.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=LIST_CSV_FIELDS, extrasaction="ignore")

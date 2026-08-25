@@ -507,7 +507,12 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["_raw_nb_xml"] = nb_xml
 
     cached["제품코드"] = barcode_key8(cached["_bar_code"]) or clean_whitespace(item_seq)
-    cached["보관방법"] = item.get("STORAGE_METHOD", "")
+   # --- [보관방법 추출 로직 보완] ---
+    storage_val = clean_whitespace(item.get("STORAGE_METHOD", ""))
+    if not storage_val and nb_xml:
+        storage_val = parse_doc_sections(nb_xml, ["보관방법", "저장방법", "보관", "저장", "보관 및 취급상의 주의사항"])
+    cached["보관방법"] = storage_val
+    # ---------------------------------
 
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))

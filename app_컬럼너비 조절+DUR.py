@@ -16,6 +16,7 @@ import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────────────────────
 # 의약품 허가정보·약가 통합 조회 — Streamlit version
+# 기존 Colab 노트북의 API 엔드포인트/필드명/매칭 규칙을 유지합니다.
 # ─────────────────────────────────────────────────────────────
 MFDS_LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 MFDS_DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
@@ -24,10 +25,11 @@ FIELD_BAR_CODE = "BAR_CODE"
 LIST_NUM_OF_ROWS = 500
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
-LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE"]
-BASE_COLUMNS = ["허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량", "보관방법"]
+LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE"]  # 바코드는 상세 API에서만 확인 가능
+BASE_COLUMNS = ["허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
 HIRA_MEFT_FIELD = "meftDivNo"
-
+# 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
+# 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
 EXTRA_FIELD_SPECS = {
     "영문제품명": {"label": "영문 제품명", "source": "ITEM_ENG_NAME", "transform": "direct"},
     "주성분영문명": {"label": "주성분 영문명", "source": "MAIN_INGR_ENG", "transform": "direct"},
@@ -46,6 +48,7 @@ EXTRA_FIELD_SPECS = {
     "기타주의사항": {"label": "기타 사용상 주의사항", "source": "NB_DOC_DATA", "keywords": ["기타"], "transform": "section"},
     "포장단위": {"label": "포장단위", "source": "PACK_UNIT", "transform": "direct"},
     "유효기간": {"label": "유효기간", "source": "VALID_TERM", "transform": "direct"},
+    "보관정보": {"label": "보관정보", "source": "STORAGE_METHOD", "transform": "direct"},
     "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항"], "transform": "section"},
     "성상": {"label": "성상", "source": "CHART", "transform": "direct"},
     "변경내용": {"label": "변경내용", "source": "GBN_NAME", "transform": "direct"},
@@ -53,16 +56,18 @@ EXTRA_FIELD_SPECS = {
 }
 EXTRA_FIELD_ORDER = [
     "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량",
-    "소아_고령자투여", "임부_수유부투여", "금기사항", "신중투여", "일반적주의",
-    "상호작용", "이상반응", "과량투여처치", "적용상의주의사항", "기타주의사항",
-    "포장단위", "유효기간", "보관_취급주의사항", "성상", "변경내용", "변경일자",
+    "소아_고령자투여", "임부_수유부투여",
+    "금기사항", "신중투여", "일반적주의",
+    "상호작용",
+    "이상반응", "과량투여처치",
+    "적용상의주의사항", "기타주의사항",
+    "포장단위", "유효기간", "보관정보", "보관_취급주의사항", "성상", "변경내용", "변경일자",
 ]
 EXTRA_FIELD_LABELS = {key: EXTRA_FIELD_SPECS[key]["label"] for key in EXTRA_FIELD_ORDER}
 EXTRA_FIELD_KEYWORDS = {key: EXTRA_FIELD_SPECS[key]["keywords"] for key in EXTRA_FIELD_ORDER if "keywords" in EXTRA_FIELD_SPECS[key]}
 EXTRA_DIRECT_FIELDS = {key: EXTRA_FIELD_SPECS[key]["source"] for key in EXTRA_FIELD_ORDER if EXTRA_FIELD_SPECS[key]["transform"] == "direct"}
-
-ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "보관방법"]
-RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량", "보관방법"]
+ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
+RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 
@@ -128,7 +133,8 @@ def parse_nested_doc_xml(xml_str):
 
 
 def parse_doc_sections(xml_str, keywords):
-    if not xml_str or not xml_str.strip() or not keywords:
+    """중첩 XML에서 title에 특정 키워드가 포함된 상위 항목과 하위 내용 추출."""
+    if not xml_str or not xml_str.strip():
         return ""
     try:
         root = ET.fromstring(xml_str.strip())
@@ -155,6 +161,7 @@ def parse_doc_sections(xml_str, keywords):
 
 
 def summarize_text(text, max_chars=420, max_sentences=3):
+    """의학적 판단을 새로 생성하지 않고, 원문 앞부분과 핵심 문장만 발췌합니다."""
     text = clean_whitespace(text)
     if not text:
         return ""
@@ -174,6 +181,7 @@ def summarize_text(text, max_chars=420, max_sentences=3):
 
 
 def summarize_usage(text, max_chars=520):
+    """용법·용량에서 성인/소아/고령자 등 투여군별 문장을 우선 발췌합니다."""
     text = clean_whitespace(text)
     if not text:
         return ""
@@ -192,15 +200,30 @@ def summarize_usage(text, max_chars=520):
 
 
 def make_summary_df(result_df):
+    """용법·용량과 효능·효과를 짧게 표시하는 규칙 기반 요약본."""
     summary_df = result_df.copy()
     if "효능효과" in summary_df.columns:
         summary_df["효능효과"] = summary_df["효능효과"].map(lambda value: summarize_text(value))
     if "용법용량" in summary_df.columns:
         summary_df["용법용량"] = summary_df["용법용량"].map(lambda value: summarize_usage(value))
     for column in summary_df.columns:
-        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "제품코드", "약가", "약효분류", "주성분영문명", "보관방법"}:
+        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
     return summary_df
+
+
+def format_price(value):
+    text = clean_whitespace(value)
+    if not text:
+        return ""
+    digits = re.sub(r"[^\d]", "", text)
+    if not digits:
+        return text
+    try:
+        number = int(digits)
+    except ValueError:
+        return text
+    return f"{number:,}원"
 
 
 def load_json_cache(path):
@@ -229,6 +252,8 @@ def barcode_key8(bar_code):
 
 
 def mdscd_key8(mds_cd):
+    """엑셀에서 숫자로 저장된 코드는 645200020.0 처럼 float로 들어오는데, 그대로
+    문자열화하면 소수점의 '0'이 붙어 코드가 틀어지므로 정수로 먼저 변환합니다."""
     if mds_cd is None:
         return None
     if isinstance(mds_cd, float):
@@ -304,31 +329,31 @@ def _excel_engine_for(filename):
     return "pyxlsb" if filename.lower().endswith(".xlsb") else None
 
 
+def _find_dur_header_row(file_bytes, filename, max_scan=15):
+    """제목 행이 위에 몇 줄 더 있는 파일 대응: '코드'가 들어간 열이 나오는 행을 헤더로 판단합니다."""
+    engine = _excel_engine_for(filename)
+    raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine=engine, nrows=max_scan)
+    for i in range(len(raw)):
+        row_vals = [str(v) for v in raw.iloc[i].tolist()]
+        if any(DUR_CODE_COLUMN_PATTERN.search(v) for v in row_vals):
+            return i
+    return 0
+
+
 def read_dur_excel(file_bytes, filename):
     engine = _excel_engine_for(filename)
-    all_sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None, engine=engine)
-    
-    parsed_dfs = []
-    for sheet_name, sheet_raw in all_sheets.items():
-        if sheet_raw.empty:
-            continue
-        header_row = 0
-        for i in range(min(len(sheet_raw), 15)):
-            row_vals = [str(v) for v in sheet_raw.iloc[i].tolist()]
-            if any(DUR_CODE_COLUMN_PATTERN.search(v) for v in row_vals):
-                header_row = i
-                break
-        
-        sheet_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row, engine=engine)
-        sheet_df.columns = [str(c).strip() for c in sheet_df.columns]
-        parsed_dfs.append(sheet_df)
-
-    if not parsed_dfs:
-        return pd.DataFrame(), 0
-    return pd.concat(parsed_dfs, ignore_index=True), 0
+    header_row = _find_dur_header_row(file_bytes, filename)
+    df = pd.read_excel(io.BytesIO(file_bytes), header=header_row, engine=engine)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, header_row
 
 
 def build_dur_index(df):
+    """코드 열이 여러 개인 DUR 파일을 폭넓게 인덱싱합니다.
+    - exact digits (예: 073400390)
+    - 앞 8자리 key (예: 07340039)
+    모두 저장해 바코드/EDI/품목코드 어느 쪽으로도 매칭되기 쉽게 만듭니다.
+    """
     code_cols = [c for c in df.columns if DUR_CODE_COLUMN_PATTERN.search(str(c))]
     if not code_cols:
         return {}, code_cols
@@ -352,6 +377,8 @@ def build_dur_index(df):
 
 @st.cache_data(show_spinner="DUR 파일을 읽는 중입니다…")
 def parse_dur_excel_cached(file_bytes, filename):
+    """파일 내용(바이트)+이름이 그대로면 캐시된 결과를 재사용해, 다른 위젯을 조작할 때마다
+    무거운 엑셀을 다시 파싱하지 않도록 합니다."""
     df, header_row = read_dur_excel(file_bytes, filename)
     index, code_columns = build_dur_index(df)
     return df, header_row, index, code_columns
@@ -439,6 +466,7 @@ def match_price(item_name, bar_code, service_key, call_counter, cache_code, cach
 
 
 def get_effect_classification(item_name, bar_code, service_key, call_counter, cache_meft, errors):
+    """심평원 응답의 meftDivNo를 항상 조회해 약효분류로 반환합니다."""
     key8 = barcode_key8(bar_code)
     cache_key = f"mdsCd:{key8}" if key8 else f"itmNm:{re.sub(r'_\(.*?\)\s*$', '', item_name or '').strip()}"
     if cache_key in cache_meft:
@@ -464,10 +492,8 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached = cache_detail.get(item_seq, {})
     have_base = "성분명" in cached
     missing_extras = [key for key in wanted_extras if key not in cached]
-    
     if have_base and not missing_extras:
         return cached
-        
     cached_direct_ready = all(
         key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
         for key in missing_extras
@@ -476,16 +502,12 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
                 cached[key] = cached.get("_raw_" + key, "")
-            elif key in EXTRA_FIELD_KEYWORDS:
-                cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
             else:
-                cached[key] = ""
+                cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
         cache_detail[item_seq] = cached
         return cached
-
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-
     call_counter["mfds"] += 1
     params = {"serviceKey": service_key, "item_seq": item_seq, "type": "json"}
     try:
@@ -497,34 +519,18 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     except (requests.RequestException, ValueError, ET.ParseError) as exc:
         errors.append(f"MFDS 상세 item_seq={item_seq}: {exc}")
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-
     nb_xml = item.get("NB_DOC_DATA", "")
     cached["성분명"] = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
     cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
     cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
+    # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
-
-    cached["제품코드"] = barcode_key8(cached["_bar_code"]) or clean_whitespace(item_seq)
-   # --- [보관방법 추출 로직 보완] ---
-    storage_val = clean_whitespace(item.get("STORAGE_METHOD", ""))
-    if not storage_val and nb_xml:
-        storage_val = parse_doc_sections(nb_xml, ["보관방법", "저장방법", "보관", "저장", "보관 및 취급상의 주의사항"])
-    cached["보관방법"] = storage_val
-    # ---------------------------------
-
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
-
     for key in wanted_extras:
-        if key in EXTRA_DIRECT_FIELDS:
-            cached[key] = cached.get("_raw_" + key, "")
-        elif key in EXTRA_FIELD_KEYWORDS:
-            cached[key] = parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
-        else:
-            cached[key] = ""
-
+        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
     cache_detail[item_seq] = cached
     return cached
 
@@ -628,7 +634,56 @@ def make_display_df(result_df, summary_view=False, transpose_view=False):
     return display_df
 
 
+def result_column_config(df):
+    """긴 텍스트는 넓게 시작하고, Streamlit 표에서 드래그로 폭을 조절합니다."""
+    config = {}
+    long_columns = {"효능효과", "용법용량", "성분명", "이상반응", "상호작용", "금기사항", "원료약품및분량"}
+    for column in df.columns:
+        config[column] = st.column_config.TextColumn(
+            label=str(column),
+            width="large" if column in long_columns else "medium",
+            help="헤더 경계를 드래그해 컬럼 너비를 조절할 수 있습니다.",
+        )
+    return config
+
+
+def filter_result_dataframe(df, widget_prefix="result_filter"):
+    """컬럼별 필터를 적용해 결과 DataFrame을 반환합니다."""
+    filtered = df.copy()
+    with st.expander("컬럼별 필터", expanded=False):
+        st.caption("문자열은 포함 검색, 범주형은 여러 값 선택, 숫자형은 범위 필터를 사용합니다.")
+        filter_columns = st.columns(2)
+        for index, column in enumerate(df.columns):
+            series = df[column].fillna("")
+            numeric = pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce")
+            numeric_ratio = numeric.notna().mean() if len(series) else 0
+            with filter_columns[index % 2]:
+                if numeric_ratio >= 0.8 and numeric.notna().any():
+                    minimum, maximum = float(numeric.min()), float(numeric.max())
+                    if minimum < maximum:
+                        selected_range = st.slider(
+                            str(column), minimum, maximum, (minimum, maximum), key=f"{widget_prefix}_num_{index}"
+                        )
+                        filtered = filtered[numeric.loc[filtered.index].between(*selected_range)]
+                    else:
+                        st.caption(f"{column}: {minimum:g}")
+                else:
+                    values = sorted({str(value) for value in series if str(value).strip()})
+                    if 0 < len(values) <= 30:
+                        selected_values = st.multiselect(
+                            str(column), values, key=f"{widget_prefix}_cat_{index}"
+                        )
+                        if selected_values:
+                            filtered = filtered[filtered[column].astype(str).isin(selected_values)]
+                    else:
+                        text = st.text_input(f"{column} 포함 검색", key=f"{widget_prefix}_text_{index}")
+                        if text.strip():
+                            filtered = filtered[filtered[column].astype(str).str.contains(text.strip(), case=False, na=False)]
+    return filtered
+
+
 def render_resizable_wrapped_table(display_df, show_index=False, height=720, table_key="result"):
+    """외부 라이브러리 없이 컬럼 드래그 리사이즈와 셀 줄바꿈을 함께 제공합니다."""
     table_df = display_df.reset_index() if show_index else display_df.reset_index(drop=True)
     if show_index:
         table_df = table_df.rename(columns={table_df.columns[0]: str(display_df.index.name or "항목")})
@@ -642,6 +697,9 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
         return html_lib.escape(str(value)).replace("\\n", "<br>")
 
     if show_index:
+        # 행/열 전환 보기: 약 하나가 세로줄 하나가 됩니다. 맨 앞(항목명) 열만 고정 폭으로 두고,
+        # 나머지 약 컬럼들은 화면 폭에서 그 만큼을 뺀 나머지를 균등하게 나눠 갖도록 %로 지정합니다.
+        # 그래서 화면을 늘리면 약별 폭이 넓어지고, 줄이면 좁아지며 전체 약이 한 화면에 들어옵니다.
         index_width_px = 160
         drug_column_count = max(len(headers) - 1, 1)
         col_widths = [f"{index_width_px}px"] + [
@@ -715,24 +773,18 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 
 
 def make_comparison_df(result_df):
+    """행에는 조회 항목, 열에는 의약품을 배치한 비교표를 생성합니다."""
     comparison = result_df.copy()
-    if "허가제품명" in comparison.columns:
-        names = comparison["허가제품명"].tolist()
-        deduped_names = []
-        name_counts = {}
-        for name in names:
-            if name in name_counts:
-                name_counts[name] += 1
-                deduped_names.append(f"{name} ({name_counts[name]})")
-            else:
-                name_counts[name] = 1
-                deduped_names.append(name)
-        comparison.index = deduped_names
-        comparison = comparison.drop(columns=["허가제품명"])
-    
-    comparison_df = comparison.T
-    comparison_df.index.name = "조회항목"
-    return comparison_df
+    comparison_names = []
+    seen = {}
+    for _, row in comparison.iterrows():
+        name = str(row.get("허가제품명", "품목"))
+        seen[name] = seen.get(name, 0) + 1
+        comparison_names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+    comparison["_비교용약품명"] = comparison_names
+    comparison = comparison.set_index("_비교용약품명").T
+    comparison.index.name = "조회 항목"
+    return comparison
 
 
 def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
@@ -742,30 +794,20 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     cache_meft = load_json_cache(CACHE_MEFT_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors = []
+    columns = BASE_COLUMNS + wanted_extras
     output = []
     progress = st.progress(0, text="조회 중입니다…")
     for index, row in enumerate(rows, start=1):
         item_seq = row.get("ITEM_SEQ", "")
         item_name = clean_whitespace(row.get("ITEM_NAME", ""))
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
+        # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
         fetch_keys = list(dict.fromkeys(ALWAYS_FETCH_DETAIL_KEYS + wanted_extras))
         detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors)
         bar_code = detail.get("_bar_code", "")
         price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        
-        out_row = {
-            "허가제품명": item_name,
-            "제약사한글명": entp_name,
-            "제품코드": detail.get("제품코드", barcode_key8(bar_code) or clean_whitespace(item_seq)),
-            "약가": price,
-            "약효분류": effect_classification,
-            "주성분영문명": detail.get("주성분영문명", ""),
-            "성분명": detail.get("성분명", ""),
-            "효능효과": detail.get("효능효과", ""),
-            "용법용량": detail.get("용법용량", ""),
-            "보관방법": detail.get("보관방법", ""),
-        }
+        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "약가": format_price(price), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         output.append(out_row)
@@ -779,6 +821,9 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
 
 
 def check_dur(rows, mfds_key, dur_indices, cache_detail, call_counter, errors):
+    """선택한 품목들이 업로드된 DUR(병용금기 등) 리스트에 포함되는지 확인합니다.
+    바코드, EDI코드, 품목코드를 모두 후보로 사용하고, 어떤 코드열에 매칭되었는지 함께 보여줍니다.
+    """
     result_rows = []
     seen_extra_cols = []
     seen_matches = set()
@@ -858,6 +903,8 @@ with st.sidebar:
         uploaded = st.file_uploader(category, type=["xlsx", "xls", "xlsb"], key=f"dur_upload_{category}")
         if uploaded is not None:
             try:
+                # 파일 내용이 바뀌지 않았으면 다시 읽지 않습니다 (그래서 검색창 등 다른 위젯을
+                # 조작해도 매번 재파싱으로 느려지지 않습니다).
                 dur_df, header_row, dur_index, code_columns = parse_dur_excel_cached(uploaded.getvalue(), uploaded.name)
             except Exception as exc:
                 st.error(f"[{category}] '{uploaded.name}' 읽기 실패: {exc}")
@@ -905,6 +952,7 @@ if query.strip():
     matches = [row for row in normal_rows if q in row.get("ITEM_NAME", "").casefold() or q in row.get("ENTP_NAME", "").casefold()][:200]
     st.caption(f"검색결과 {len(matches)}건 표시 (최대 200건)")
 
+# 검색 결과를 드롭다운이 아닌 전체 행이 보이는 선택 가능한 표로 표시합니다.
 if matches:
     search_df = pd.DataFrame([
         {"의약품명": row.get("ITEM_NAME", ""), "제약사": row.get("ENTP_NAME", ""), "품목코드": row.get("ITEM_SEQ", "")}
@@ -917,8 +965,10 @@ if matches:
         height=min(520, 36 + len(search_df) * 35),
         selection_mode="multi-row",
         on_select="rerun",
+        # 검색어별로 위젯 상태를 분리해 첫 행이 자동 선택되지 않도록 합니다.
         key=f"search_results_table_{query.strip().casefold()}",
     )
+    # selection.rows는 현재 검색표의 위치 인덱스이므로 반드시 iloc로 매핑합니다.
     search_selected_seqs = [
         str(search_df.iloc[index]["품목코드"])
         for index in search_event.selection.rows
@@ -985,12 +1035,13 @@ if st.session_state.last_result is not None:
     with result_tab:
         transpose_view = st.checkbox(
             "행/열 전환", key="result_transpose", value=True,
-            help="표시와 CSV 다운로드 모두 행/열을 전환합니다.",
+            help="표시와 CSV 다운로드 모두 행/열을 전환합니다. 켜면 약 하나가 세로줄 하나가 되고, 화면 폭에 맞춰 각 약의 너비가 자동으로 좁아지거나 넓어집니다.",
         )
         displayed_df = make_display_df(filtered_result_df, summary_view=summary_view, transpose_view=transpose_view)
         if summary_view:
-            st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다.")
+            st.caption("요약 버전: 원문에서 문장 단위로 발췌한 표시용 요약입니다. 임상적 판단을 대신하지 않습니다.")
         render_resizable_wrapped_table(displayed_df, show_index=transpose_view, height=720, table_key="detail")
+        # 화면에 표시한 동일한 DataFrame을 사용하므로 행/열 전환 상태가 CSV에도 반영됩니다.
         csv_bytes = displayed_df.to_csv(index=transpose_view, encoding="utf-8-sig").encode("utf-8-sig")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_suffix = "_행열전환" if transpose_view else ""

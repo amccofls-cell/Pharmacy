@@ -37,7 +37,7 @@ EXTRA_FIELD_SPECS = {
     "ATC코드": {"label": "ATC 코드", "source": "ATC_CODE", "transform": "direct"},
     "원료약품및분량": {"label": "원료약품 및 분량", "source": "MATERIAL_NAME", "transform": "direct"},
     "소아_고령자투여": {"label": "소아·고령자 투여", "source": "NB_DOC_DATA", "keywords": ["소아에 대한 투여", "소아투여", "고령자에 대한 투여", "고령자투여"], "transform": "section"},
-    "임부_수유부투여": {"label": "임부 및 수유부 투여", "source": "NB_DOC_DATA", "keywords": ["임부 및 수유부에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"], "transform": "section"},
+    "임부_수유부투여": {"label": "임부 및 수유부 투여", "source": "NB_DOC_DATA", "keywords": ["임부 및 수유부에 대한 투여", "임부, 수유부, 가임여성 및 남성에 대한 투여", "가임여성 및 남성에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"], "transform": "section"},
     "금기사항": {"label": "금기사항", "source": "NB_DOC_DATA", "keywords": ["다음 환자에게는 투여하지 말 것", "투여하지 말 것", "금기"], "transform": "section"},
     "신중투여": {"label": "신중히 투여할 환자", "source": "NB_DOC_DATA", "keywords": ["다음 환자에는 신중히 투여할 것", "신중히 투여"], "transform": "section"},
     "일반적주의": {"label": "일반적 주의", "source": "NB_DOC_DATA", "keywords": ["일반적 주의"], "transform": "section"},
@@ -66,6 +66,10 @@ EXTRA_FIELD_ORDER = [
 EXTRA_FIELD_LABELS = {key: EXTRA_FIELD_SPECS[key]["label"] for key in EXTRA_FIELD_ORDER}
 EXTRA_FIELD_KEYWORDS = {key: EXTRA_FIELD_SPECS[key]["keywords"] for key in EXTRA_FIELD_ORDER if "keywords" in EXTRA_FIELD_SPECS[key]}
 EXTRA_DIRECT_FIELDS = {key: EXTRA_FIELD_SPECS[key]["source"] for key in EXTRA_FIELD_ORDER if EXTRA_FIELD_SPECS[key]["transform"] == "direct"}
+NEW_DRUG_PRESET_KEYS = [
+    "영문제품명", "ATC코드", "포장단위", "주성분영문명", "원료약품및분량",
+    "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
+]
 ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
 RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
@@ -1007,6 +1011,20 @@ else:
 st.write(f"현재 선택된 품목: **{len(st.session_state.selection)}건**")
 
 st.subheader("3. 추가 조회 항목")
+if "preset_new_drug_intro" not in st.session_state:
+    st.session_state.preset_new_drug_intro = all(st.session_state.get(f"extra_{key}", False) for key in NEW_DRUG_PRESET_KEYS)
+if "preset_new_drug_intro_prev" not in st.session_state:
+    st.session_state.preset_new_drug_intro_prev = st.session_state.preset_new_drug_intro
+st.checkbox(
+    "[신약 도입 준비]",
+    key="preset_new_drug_intro",
+    help="영문 제품명, ATC 코드, 포장단위, 주성분 영문명, 원료약품 및 분량, 유효기간, 성상, 전문·일반의약품 구분, 보관정보, 보관 및 취급상의 주의사항을 한 번에 선택/해제합니다.",
+)
+if st.session_state.preset_new_drug_intro != st.session_state.preset_new_drug_intro_prev:
+    for preset_key in NEW_DRUG_PRESET_KEYS:
+        st.session_state[f"extra_{preset_key}"] = st.session_state.preset_new_drug_intro
+    st.session_state.preset_new_drug_intro_prev = st.session_state.preset_new_drug_intro
+    st.rerun()
 selected_extras = []
 extra_columns = st.columns(3)
 for index, key in enumerate(EXTRA_FIELD_ORDER):

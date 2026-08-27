@@ -136,6 +136,13 @@ def parse_nested_doc_xml(xml_str):
     return clean_markup(" ".join(parts))
 
 
+def normalize_section_title(text):
+    text = clean_whitespace(text)
+    text = re.sub(r"^\s*\d+\s*[.\-)]\s*", "", text)
+    text = re.sub(r"[\s,·ㆍ/()\[\]{}:;]", "", text)
+    return text
+
+
 def parse_doc_sections(xml_str, keywords):
     """중첩 XML에서 title에 특정 키워드가 포함된 상위 항목과 하위 내용 추출."""
     if not xml_str or not xml_str.strip():
@@ -144,6 +151,7 @@ def parse_doc_sections(xml_str, keywords):
         root = ET.fromstring(xml_str.strip())
     except ET.ParseError:
         return ""
+    normalized_keywords = [normalize_section_title(keyword) for keyword in keywords if keyword]
     chunks = []
     for el in root.iter():
         title = el.get("title")
@@ -156,11 +164,15 @@ def parse_doc_sections(xml_str, keywords):
     if heading_idx:
         for n, idx in enumerate(heading_idx):
             heading_text = chunks[idx][1]
-            if any(keyword in heading_text for keyword in keywords):
+            normalized_heading = normalize_section_title(heading_text)
+            if any(keyword in normalized_heading or normalized_heading in keyword for keyword in normalized_keywords):
                 end = heading_idx[n + 1] if n + 1 < len(heading_idx) else len(chunks)
                 picked.extend(text for _, text in chunks[idx:end])
     else:
-        picked.extend(text for _, text in chunks if any(keyword in text for keyword in keywords))
+        picked.extend(
+            text for _, text in chunks
+            if any(keyword in normalize_section_title(text) for keyword in normalized_keywords)
+        )
     return clean_markup(" ".join(picked))
 
 
@@ -495,7 +507,7 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
 def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors):
     cached = cache_detail.get(item_seq, {})
     have_base = "성분명" in cached
-    missing_extras = [key for key in wanted_extras if key not in cached]
+    missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
     if have_base and not missing_extras:
         return cached
     cached_direct_ready = all(

@@ -110,11 +110,23 @@ def clean_ingredient(text):
     return clean_whitespace(re.sub(r"\[[A-Za-z0-9]+\]", "", text))
 
 
+def unescape_html_repeated(text, rounds=3):
+    if text is None:
+        return ""
+    value = str(text)
+    for _ in range(max(1, rounds)):
+        new_value = html_lib.unescape(value)
+        if new_value == value:
+            break
+        value = new_value
+    return value.replace("\xa0", " ").replace("&nbsp;", " ")
+
+
 def clean_markup(text):
     if not text:
         return ""
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    text = html_lib.unescape(text)
+    text = unescape_html_repeated(text)
     text = re.sub(r"</?[a-zA-Z][^>]*>", "", text)
     return clean_whitespace(text)
 
@@ -137,6 +149,7 @@ def parse_nested_doc_xml(xml_str):
 
 
 def normalize_section_title(text):
+    text = unescape_html_repeated(text)
     text = clean_whitespace(text)
     text = re.sub(r"^\s*\d+\s*[.\-)]\s*", "", text)
     text = re.sub(r"[\s,·ㆍ/()\[\]{}:;]", "", text)

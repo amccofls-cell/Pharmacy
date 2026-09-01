@@ -899,6 +899,167 @@ def check_dur(rows, mfds_key, dur_indices, cache_detail, call_counter, errors):
     return pd.DataFrame(result_rows, columns=columns)
 
 
+# ─────────────────────────────────────────────────────────────
+# 비교표 검증 (원본: 의약품 심의자료 검증기 Streamlit v6.2 / app(1).py)
+# 검색·후보 선택·항목 추출은 위쪽 app.py 로직을 그대로 쓰고,
+# 이 블록은 "3번에서 조회한 result_df"를 원문으로 삼아 사용자가 붙여넣은
+# 비교표(심의자료)를 검증하는 기능만 담당한다. 함수명은 위쪽 app.py의
+# 동명 함수(fetch_detail 등)와 절대 겹치지 않도록 cmp_ 접두사를 붙였다.
+# ─────────────────────────────────────────────────────────────
+CMP_SEMANTIC_FIELDS = ["적응증", "용법용량", "소아", "금기"]
+
+# 비교표에서 쓰는 자연스러운 필드명 → 위 app.py가 만드는 result_df의 실제 컬럼명.
+# 값이 None인 항목(제형)은 result_df에 직접 컬럼이 없어 허가제품명에서 규칙 기반으로 추출한다.
+CMP_FIELD_TO_RESULT_COLUMN = {
+    "의약품명": "허가제품명",
+    "성분명": "성분명",
+    "제조판매사": "제약사한글명",
+    "함량": "원료약품및분량",   # "3번 추가 조회 항목"에서 [원료약품 및 분량]을 선택해야 값이 채워진다
+    "제형": None,               # 허가제품명에서 규칙 기반 추출 (아래 cmp_form)
+    "적응증": "효능효과",
+    "용법용량": "용법용량",
+    "소아": "소아_고령자투여",   # "3번"에서 [소아·고령자 투여]를 선택해야 값이 채워진다
+    "보관": "보관정보",         # "3번"에서 [보관정보]를 선택해야 값이 채워진다
+    "금기": "금기사항",         # "3번"에서 [금기사항]을 선택해야 값이 채워진다
+    "약가": "약가",
+}
+# 위 매핑 중 "3번 추가 조회 항목" 체크박스가 있어야만 값이 채워지는 컬럼들.
+# 사용자가 해당 체크박스를 켜지 않았으면 "미조회"임을 명확히 구분해서 안내한다.
+CMP_OPTIONAL_EXTRA_COLUMNS = {"원료약품및분량", "소아_고령자투여", "보관정보", "금기사항"}
+
+
+def cmp_normalize(text):
+    """공백·괄호·중점 등 제거 후 lower() — 제품명 매칭/단순 비교용 (app(1).py의 _normalize)."""
+    if not text:
+        return ""
+    s = re.sub(r"\s+", "", str(text))
+    s = re.sub(r"[\(\)\[\]\{\}_:·,\.\-]", "", s)
+    return s.lower()
+
+
+def cmp_amount(name):
+    """제품명 문자열에서 함량(숫자+단위) 추출 — 함량을 직접 조회하지 않았을 때의 대체 수단."""
+    m = re.search(
+        r"\d+(?:\.\d+)?\s*(?:mg|g|mcg|μg|㎍|IU|mEq|mL|%)\s*(?:/\s*\d+(?:\.\d+)?\s*(?:mg|mL))?",
+        name or "",
+    )
+    return m.group(0).strip() if m else ""
+
+
+_CMP_FORM_MAP = [
+    ("서방정", ["SR", "CR", "XR", "ER", "서방"]),
+    ("캡슐", ["Cap", "Capsule", "캡슐"]),
+    ("주사", ["Inj", "Injection", "주사"]),
+    ("바이알", ["vial", "Vial"]),
+    ("펜", ["pen", "Pen"]),
+    ("현탁액", ["Susp", "susp"]),
+    ("점안액", ["Ophth", "eye"]),
+    ("정", ["Tab", "Tablet", "정"]),
+    ("설하정", ["설하"]),
+]
+
+
+def cmp_form(name):
+    """제품명 문자열에서 제형 추정 — app.py의 result_df에는 제형 컬럼이 따로 없어 항상 이 방식으로 구한다."""
+    for ko, syns in _CMP_FORM_MAP:
+        for s in syns:
+            if s.lower() in (name or "").lower():
+                return ko
+    return ""
+
+
+def parse_compare_table(text):
+    """사용자가 붙여넣은 비교표 텍스트를 파싱한다.
+    한 줄 = '필드명|값', 빈 줄 = 제품 구분. (app(1).py의 parse_compare)"""
+    if not text.strip():
+        return []
+    items, current = [], {}
+    for raw in text.split("\n"):
+        ln = raw.strip()
+        if not ln:
+            if current:
+                items.append(current)
+                current = {}
+            continue
+        if "|" in ln and re.match(r"^[가-힣A-Za-z]", ln):
+            k, v = ln.split("|", 1)
+            k, v = k.strip(), v.strip()
+            if k == "의약품명" and current:
+                items.append(current)
+                current = {}
+            current[k] = v
+        else:
+            current["비고"] = (current.get("비고", "") + " " + ln).strip()
+    if current:
+        items.append(current)
+    return items
+
+
+def compare_one_field(field, table_val, src_val, extra_not_fetched=False):
+    """비교표 기재값(table_val)과 원문값(src_val) 하나를 판정한다. (app(1).py의 compare_one 기반)
+    extra_not_fetched=True면 '3번 추가 조회 항목'을 아예 선택하지 않아 원문 자체를 조회하지
+    않은 상태이므로, 단순 빈 값과 구분해 안내한다."""
+    tv = (table_val or "").strip()
+    sv = (src_val or "").strip()
+    if extra_not_fetched and not sv:
+        return "⚪ 확인 불가", "이 항목은 '3번 추가 조회 항목'에서 선택하지 않아 원문을 조회하지 않았습니다."
+    if not tv and not sv:
+        return "⚪ 확인 불가", "양쪽 모두 비어있음"
+    if not tv:
+        return "🔴 수정 필요", "비교표에 기재 누락"
+    if not sv:
+        return "⚪ 확인 불가", "원문(API)에 해당 항목 값이 비어있음"
+    if field in ("약가", "함량"):
+        tn = re.sub(r"[^\d.]", "", tv)
+        sn = re.sub(r"[^\d.]", "", sv)
+        if not tn or not sn:
+            return "⚪ 확인 불가", "수치 파싱 실패"
+        return ("🟢 일치" if tn == sn else "🔴 수정 필요"), f"비교표={tn}, 원문={sn}"
+    if field in CMP_SEMANTIC_FIELDS:
+        return "🟠 의미 단위 — LLM 확인 필요", "지침에 따른 의미 비교가 필요합니다 (아래 LLM 프롬프트 참고)"
+    tn, sn = cmp_normalize(tv), cmp_normalize(sv)
+    if tn == sn:
+        return "🟢 일치", "정규화 일치"
+    if tn in sn or sn in tn:
+        return "🟡 확인 필요", "정규화 부분 일치 (표현 차이 가능)"
+    return "🔴 수정 필요", f"정규화 불일치: [{tv}] vs [{sv}]"
+
+
+def match_compare_item_to_result_row(cmp_item, result_df):
+    """비교표 항목의 '의약품명'을 result_df(3번에서 조회한 원문)의 허가제품명과 매칭한다."""
+    name = cmp_normalize(cmp_item.get("의약품명", ""))
+    if not name or result_df.empty:
+        return None
+    # 1) 완전 일치
+    for _, row in result_df.iterrows():
+        if cmp_normalize(row.get("허가제품명", "")) == name:
+            return row
+    # 2) 부분 포함(양방향)
+    for _, row in result_df.iterrows():
+        rn = cmp_normalize(row.get("허가제품명", ""))
+        if rn and (name in rn or rn in name):
+            return row
+    return None
+
+
+def build_cmp_source_value(field, result_row):
+    """result_df 한 행에서 비교표 필드에 대응하는 '원문값'을 구한다.
+    반환: (원문값, 이 항목을 3번에서 선택하지 않아 애초에 조회되지 않은 것인지 여부)"""
+    column = CMP_FIELD_TO_RESULT_COLUMN.get(field)
+    product_name = result_row.get("허가제품명", "")
+    if field == "제형":
+        return cmp_form(product_name), False
+    if column is None:
+        return "", False
+    value = clean_whitespace(result_row.get(column, "")) if column in result_row.index else ""
+    if not value and field == "함량":
+        # 원료약품및분량을 조회하지 않았거나 비어있으면 제품명에서 규칙 기반으로 대체 추출
+        derived = cmp_amount(product_name)
+        return derived, (column in CMP_OPTIONAL_EXTRA_COLUMNS and column not in result_row.index)
+    extra_not_fetched = (column in CMP_OPTIONAL_EXTRA_COLUMNS) and (column not in result_row.index)
+    return value, extra_not_fetched
+
+
 st.set_page_config(page_title="의약품 통합 조회", page_icon="💊", layout="wide")
 st.title("💊 의약품 허가정보·약가 통합 조회")
 st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조회합니다. 데이터의 기준일과 API 응답을 함께 확인하세요.")
@@ -1074,7 +1235,7 @@ if st.session_state.last_result is not None:
     st.subheader("조회 결과")
     result_df = st.session_state.last_result
     filtered_result_df = result_df
-    result_tab, comparison_tab, dur_tab = st.tabs(["상세 결과", "여러 약품 비교표", "DUR 확인"])
+    result_tab, comparison_tab, dur_tab, cmp_tab = st.tabs(["상세 결과", "여러 약품 비교표", "DUR 확인", "🧾 비교표 검증"])
     with result_tab:
         transpose_view = st.checkbox(
             "행/열 전환", key="result_transpose", value=True,
@@ -1129,6 +1290,104 @@ if st.session_state.last_result is not None:
                     with st.expander(f"DUR 확인 중 경고/오류 {len(st.session_state.dur_errors)}건"):
                         for error in st.session_state.dur_errors:
                             st.warning(error)
+
+    with cmp_tab:
+        st.caption(
+            "3번에서 조회한 위 원문(result_df)을 기준으로, 사용자가 붙여넣은 심의자료 비교표를 검증합니다. "
+            "**비교표에 실제로 적은 항목만** 판정합니다 — 적지 않은 항목은 원문에 있어도 검토하지 않습니다."
+        )
+        cmp_default = (
+            "의약품명|리리카CR서방정330밀리그램\n"
+            "함량|330mg\n"
+            "제형|서방정\n"
+            "적응증|말초성 신경병증 통증\n"
+            "용법용량|초기 1일 165mg, 최대 660mg\n"
+            "약가|1,399원\n"
+            "\n"
+            "의약품명|리리카캡슐75밀리그램\n"
+            "함량|75mg\n"
+            "약가|523원\n"
+        )
+        cmp_text = st.text_area(
+            "비교표 입력 (한 줄 = '필드명|값', 빈 줄 = 제품 구분)", value=cmp_default, height=200, key="cmp_text",
+        )
+        cmp_items = parse_compare_table(cmp_text)
+
+        if not cmp_items:
+            st.info("비교표를 입력하면 여기에 검증 결과가 표시됩니다.")
+        else:
+            rows_for_table = []
+            for cmp_item in cmp_items:
+                product_label = cmp_item.get("의약품명", "(의약품명 미기재)")
+                result_row = match_compare_item_to_result_row(cmp_item, filtered_result_df)
+                if result_row is None:
+                    rows_for_table.append({
+                        "품목": product_label, "필드": "(제품 매칭)",
+                        "비교표": product_label, "원문": "",
+                        "판정": "⚪ 확인 불가",
+                        "근거": "위 원문 조회 목록에서 이 제품명과 일치/유사한 항목을 찾지 못했습니다. 3번에서 해당 품목을 함께 조회했는지 확인하세요.",
+                    })
+                    continue
+                # 비교표에 실제로 적힌 필드만 검토한다 ('의약품명'·'비고'는 식별용이라 제외)
+                for field, tbl_val in cmp_item.items():
+                    if field in ("의약품명", "비고"):
+                        continue
+                    src_val, extra_not_fetched = build_cmp_source_value(field, result_row)
+                    status, reason = compare_one_field(field, tbl_val, src_val, extra_not_fetched)
+                    rows_for_table.append({
+                        "품목": result_row.get("허가제품명", product_label), "필드": field,
+                        "비교표": tbl_val or "(빈칸)", "원문": src_val or "(없음)",
+                        "판정": status, "근거": reason,
+                    })
+
+            color_map = {
+                "🟢 일치": "#16a34a", "🔴 수정 필요": "#dc2626",
+                "🟡 확인 필요": "#ca8a04", "🟠 의미 단위 — LLM 확인 필요": "#ea580c",
+                "⚪ 확인 불가": "#9ca3af",
+            }
+            for row in rows_for_table:
+                color = color_map.get(row["판정"], "#9ca3af")
+                st.markdown(
+                    f"<div style='border-left:5px solid {color};padding:8px 12px;"
+                    f"background:#fafafa;margin-bottom:6px;border-radius:4px'>"
+                    f"<b>{row['품목']}</b> · <b>{row['필드']}</b> · "
+                    f"<span style='color:{color};font-weight:700'>{row['판정']}</span>"
+                    f"<br/><small>비교표: {row['비교표'][:160]}</small><br/>"
+                    f"<small>원문: {row['원문'][:160]}</small><br/>"
+                    f"<small style='color:#666'>근거: {row['근거']}</small></div>",
+                    unsafe_allow_html=True,
+                )
+
+            llm_prompts = [r for r in rows_for_table if "🟠" in r["판정"]]
+            if llm_prompts:
+                with st.expander(f"🤖 의미 단위 LLM 프롬프트 ({len(llm_prompts)}건) — 적응증·용법용량·소아·금기"):
+                    st.caption(
+                        "숫자·단순일치는 이미 규칙으로 판정했습니다. 이 항목들은 의미(요약/범위/조건삭제 여부) 비교가 "
+                        "필요해 LLM 확인용 프롬프트로 제공합니다. 그대로 복사해 Claude 등에 붙여넣으세요."
+                    )
+                    for i, row in enumerate(llm_prompts, 1):
+                        prompt = (
+                            f"[비교표 기재 내용]\n\"{row['비교표']}\"\n\n"
+                            f"[공식 원문 — 식약처/심평원]\n\"{row['원문']}\"\n\n"
+                            f"품목: {row['품목']}\n필드: {row['필드']}\n\n"
+                            "지침: 비교표 문장이 원문에 비추어 사실인지만 판단하라. 표현이 달라도 핵심 의미가 "
+                            "유지되면 '일치'다. 대상환자/연령/선행치료/병용요법 등 핵심 조건이 삭제되어 범위가 "
+                            "넓어지거나 원문에 없는 내용이 있으면 '수정필요'다. 원문에 없는 정보는 추측하지 마라.\n"
+                            "판정 후보: 🟢 일치 / 🟡 표현차이 / 🔴 수정필요 / ⚪ 확인불가"
+                        )
+                        st.text_area(f"프롬프트 #{i} · {row['품목']} · {row['필드']}", value=prompt, height=160, key=f"cmp_llm_p_{i}")
+
+            cmp_buf = ["품목,필드,비교표,원문,판정,근거"]
+            for row in rows_for_table:
+                cmp_buf.append(
+                    f"{row['품목']},{row['필드']},\"{row['비교표']}\",\"{row['원문']}\",{row['판정']},{row['근거']}"
+                )
+            cmp_csv_bytes = ("\uFEFF" + "\n".join(cmp_buf)).encode("utf-8")
+            st.download_button(
+                "⬇ 비교표 검증결과.csv 다운로드", data=cmp_csv_bytes,
+                file_name=f"비교표검증결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv",
+                key="cmp_csv_download",
+            )
 
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
